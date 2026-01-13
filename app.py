@@ -1,86 +1,52 @@
+# ===============================
+# NHL VALUE BETTING APP
+# ===============================
+
 import os
+import csv
 import requests
 import streamlit as st
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone
 
-# -----------------------------
-# Helpers (display + math)
-# -----------------------------
+# -------------------------------
+# BASIC HELPERS
+# -------------------------------
 def implied_prob_from_odds(odds: int) -> float:
-    """Convert American odds to implied probability (0–1)."""
     if odds > 0:
         return 100 / (odds + 100)
     return abs(odds) / (abs(odds) + 100)
 
 def payout_from_odds(stake: float, odds: int) -> float:
-    """Total return (stake + profit) for American odds."""
     if odds > 0:
         return stake + (stake * odds / 100)
     return stake + (stake * 100 / abs(odds))
 
-def american_to_implied_prob(odds: int) -> float:
-    """American odds -> implied prob (0–1)."""
-    if odds > 0:
-        return 100.0 / (odds + 100.0)
-    return (-odds) / ((-odds) + 100.0)
-
-def devig_two_way(p1: float, p2: float):
-    """Remove vig from two-way market probabilities."""
-    s = p1 + p2
-    if s <= 0:
-        return 0.5, 0.5
-    return p1 / s, p2 / s
-
 def profit_per_1_stake(odds: int) -> float:
-    """Profit returned for a 1.0 unit stake (excluding stake)."""
     if odds > 0:
-        return odds / 100.0
-    return 100.0 / (-odds)
+        return odds / 100
+    return 100 / abs(odds)
 
 def ev_per_1_stake(p_true: float, odds: int) -> float:
-    """
-    EV per $1 staked:
-      win -> +profit_per_1_stake(odds)
-      lose -> -1
-    """
-    profit = profit_per_1_stake(odds)
-    return p_true * profit - (1 - p_true)
+    return p_true * profit_per_1_stake(odds) - (1 - p_true)
 
-def kelly_fraction(p_true: float, odds: int) -> float:
-    """
-    Kelly fraction for American odds.
-    Returns fraction of bankroll to bet (0–1).
-    """
-    b = profit_per_1_stake(odds)  # net profit per $1
-    q = 1 - p_true
-    if b <= 0:
-        return 0.0
-    f = (b * p_true - q) / b
-    return max(0.0, f)
+def devig_two_way(p1, p2):
+    s = p1 + p2
+    return (p1 / s, p2 / s) if s > 0 else (0.5, 0.5)
 
-def format_commence_time(iso_str: str) -> str:
-    """Convert ISO commence_time to America/Chicago display string."""
-    if not iso_str:
-        return "Time TBD"
-    try:
-        # Odds API usually returns 'Z' for UTC
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        dt_ct = dt.astimezone(ZoneInfo("America/Chicago"))
-        return dt_ct.strftime("%b %d, %I:%M %p CT").replace(" 0", " ")
-    except Exception:
-        return iso_str
+def confidence_label(ev):
+    if ev >= 0.05:
+        return "STRONG ✅"
+    if ev >= 0.03:
+        return "MEDIUM 👍"
+    if ev >= 0.015:
+        return "SMALL ⚠️"
+    return "TINY"
 
-# -----------------------------
-# App config
-# -----------------------------
-st.set_page_config(page_title="NHL Picks", page_icon="🏒", layout="centered")
-
+# -------------------------------
+# ODDS FETCH
+# -------------------------------
 API_KEY = os.getenv("ODDS_API_KEY", "").strip()
 
-# -----------------------------
-# Data fetch
-# -----------------------------
 def fetch_odds():
     url = "https://api.the-odds-api.com/v4/sports/icehockey_nhl/odds"
     params = {
@@ -88,260 +54,118 @@ def fetch_odds():
         "regions": "us",
         "markets": "h2h,spreads",
         "oddsFormat": "american",
-        "dateFormat": "iso",
     }
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
     return r.json()
 
-# -----------------------------
-# Candidate generation
-# -----------------------------
-def pick_candidates(games_json):
+# -------------------------------
+# CANDIDATE BUILDER
+# -------------------------------
+def pick_candidates(games):
     candidates = []
 
-    for g in games_json:
-        game_id = g.get("id")
-        home = g.get("home_team")
-        away = g.get("away_team")
-        commence = g.get("commence_time")
-        matchup = f"{away} @ {home}" if away and home else "Matchup TBD"
-        start_ct = format_commence_time(commence)
+    for g in games:
+        home = g["home_team"]
+        away = g["away_team"]
+        game_id = g["id"]
 
-        books = g.get("bookmakers", []) or []
+        books = g.get("bookmakers", [])
 
-        # ----- MONEYLINE -----
-        ml_book_probs = []  # list of (p_home_true, p_away_true)
-        ml_best = {
-            home: {"odds": None, "book": None},
-            away: {"odds": None, "book": None},
-        }
-
-        # ----- PUCK LINE (SPREADS) -----
-        pl_book_probs = {}  # line_id -> list of (t1, t2, k1, k2)
-        pl_best = {}        # line_id -> { outcome_key: {"odds": int, "book": str, "point": float} }
+        ml_probs = []
+        ml_best = {home: None, away: None}
 
         for b in books:
-            book_name = b.get("title") or b.get("key") or "book"
-            for m in (b.get("markets") or []):
-                mkey = m.get("key")
-                outcomes = m.get("outcomes") or []
-
-                # Moneyline
-                if mkey == "h2h" and len(outcomes) == 2:
-                    o1, o2 = outcomes[0], outcomes[1]
-                    n1, n2 = o1.get("name"), o2.get("name")
-                    p1, p2 = o1.get("price"), o2.get("price")
-                    if not isinstance(p1, int) or not isinstance(p2, int):
-                        continue
-
-                    ip1 = american_to_implied_prob(p1)
-                    ip2 = american_to_implied_prob(p2)
+            for m in b.get("markets", []):
+                if m["key"] == "h2h":
+                    o1, o2 = m["outcomes"]
+                    p1, p2 = o1["price"], o2["price"]
+                    ip1 = implied_prob_from_odds(p1)
+                    ip2 = implied_prob_from_odds(p2)
                     t1, t2 = devig_two_way(ip1, ip2)
 
-                    # map to home/away
-                    if n1 == home and n2 == away:
-                        ml_book_probs.append((t1, t2))
-                    elif n1 == away and n2 == home:
-                        ml_book_probs.append((t2, t1))
+                    if o1["name"] == home:
+                        ml_probs.append((t1, t2))
                     else:
-                        continue
+                        ml_probs.append((t2, t1))
 
-                    # track best odds
-                    for nm, od in [(n1, p1), (n2, p2)]:
-                        if nm in ml_best:
-                            cur = ml_best[nm]["odds"]
-                            if cur is None or od > cur:
-                                ml_best[nm] = {"odds": od, "book": book_name}
+                    for o in [o1, o2]:
+                        team = o["name"]
+                        if ml_best[team] is None or o["price"] > ml_best[team]["odds"]:
+                            ml_best[team] = {"odds": o["price"], "book": b["title"]}
 
-                # Puck line (spreads)
-                if mkey == "spreads" and len(outcomes) == 2:
-                    o1, o2 = outcomes[0], outcomes[1]
-                    n1, n2 = o1.get("name"), o2.get("name")
-                    p1, p2 = o1.get("price"), o2.get("price")
-                    pt1, pt2 = o1.get("point"), o2.get("point")
-                    if not isinstance(p1, int) or not isinstance(p2, int):
-                        continue
-                    if not isinstance(pt1, (int, float)) or not isinstance(pt2, (int, float)):
-                        continue
-
-                    k1 = f"{n1} {pt1:+g}"
-                    k2 = f"{n2} {pt2:+g}"
-                    line_id = f"{k1}__vs__{k2}"
-
-                    ip1 = american_to_implied_prob(p1)
-                    ip2 = american_to_implied_prob(p2)
-                    t1, t2 = devig_two_way(ip1, ip2)
-
-                    pl_book_probs.setdefault(line_id, []).append((t1, t2, k1, k2))
-                    pl_best.setdefault(line_id, {})
-
-                    for k, od, pt in [(k1, p1, pt1), (k2, p2, pt2)]:
-                        cur = pl_best[line_id].get(k, {}).get("odds")
-                        if cur is None or od > cur:
-                            pl_best[line_id][k] = {"odds": od, "book": book_name, "point": pt}
-
-        # Moneyline consensus true probs (average de-vig across books)
-        if ml_book_probs:
-            p_home = sum(x[0] for x in ml_book_probs) / len(ml_book_probs)
-            p_away = sum(x[1] for x in ml_book_probs) / len(ml_book_probs)
+        if ml_probs:
+            p_home = sum(x[0] for x in ml_probs) / len(ml_probs)
+            p_away = sum(x[1] for x in ml_probs) / len(ml_probs)
 
             for team, p_true in [(home, p_home), (away, p_away)]:
-                best = ml_best.get(team)
-                if best and best["odds"] is not None:
-                    odds = best["odds"]
-                    ev = ev_per_1_stake(p_true, odds)
-                    candidates.append({
-                        "game_id": game_id,
-                        "matchup": matchup,
-                        "start_time": start_ct,
-                        "market": "ML",
-                        "pick": f"{team} ML",
-                        "odds": odds,
-                        "book": best["book"],
-                        "ev": ev
-                    })
-
-        # Puck line consensus per line_id (average de-vig across books)
-        for line_id, rows in pl_book_probs.items():
-            p1 = sum(r[0] for r in rows) / len(rows)
-            p2 = sum(r[1] for r in rows) / len(rows)
-            k1 = rows[0][2]
-            k2 = rows[0][3]
-
-            for k, p_true in [(k1, p1), (k2, p2)]:
-                best = pl_best[line_id].get(k)
-                if best and best["odds"] is not None:
-                    odds = best["odds"]
-                    ev = ev_per_1_stake(p_true, odds)
-                    candidates.append({
-                        "game_id": game_id,
-                        "matchup": matchup,
-                        "start_time": start_ct,
-                        "market": "PL",
-                        "pick": f"{k}",
-                        "odds": odds,
-                        "book": best["book"],
-                        "ev": ev
-                    })
+                odds = ml_best[team]["odds"]
+                ev = ev_per_1_stake(p_true, odds)
+                candidates.append({
+                    "game_id": game_id,
+                    "pick": f"{team} ML",
+                    "market": "ML",
+                    "odds": odds,
+                    "book": ml_best[team]["book"],
+                    "ev": ev
+                })
 
     return candidates
 
-def stake_split(total: int, n: int):
-    """Even split (flat staking)."""
-    if n <= 0:
-        return []
-    if n == 1:
-        return [total]
-    if n == 2:
-        return [total // 2, total - (total // 2)]
-    a = total // 3
-    return [a, a, total - 2 * a]
+# -------------------------------
+# STREAMLIT UI
+# -------------------------------
+st.set_page_config(page_title="NHL Value Bets", page_icon="🏒")
+st.title("🏒 NHL Value Betting Model")
 
-# -----------------------------
-# UI
-# -----------------------------
-st.title("🏒 NHL Picks")
-st.caption("Pregame only • Moneyline + Puck line • Top 1–3 by edge")
+st.caption("Finds mispriced odds before games start. Bets only when the math says yes.")
 
-daily_bankroll = st.number_input("Daily bankroll ($)", min_value=10, max_value=1000, value=100, step=10)
-min_ev = st.slider("Minimum EV (edge) per $1 stake", min_value=0.00, max_value=0.10, value=0.03, step=0.005)
-max_picks = st.selectbox("Max picks", options=[1, 2, 3], index=2)
-stake_method = st.selectbox("Stake method", ["Flat (even split)", "Half Kelly", "Quarter Kelly"], index=0)
+# --- Intuitive Controls ---
+pickiness = st.select_slider(
+    "How picky should the model be?",
+    options=["🔓 Loose", "⚖️ Balanced", "🔒 Strict"],
+    value="⚖️ Balanced"
+)
+
+EV_MAP = {
+    "🔓 Loose": 0.015,
+    "⚖️ Balanced": 0.025,
+    "🔒 Strict": 0.035
+}
+min_ev = EV_MAP[pickiness]
+
+max_picks = st.slider("How many top bets to show?", 1, 10, 5)
+daily_bankroll = st.number_input("Daily bankroll ($)", 10, 2000, 100, 10)
 
 if not API_KEY:
-    st.error("ODDS_API_KEY is not set in Railway Variables.")
+    st.error("ODDS_API_KEY not set in Railway variables.")
     st.stop()
 
-if st.button("Run Picks"):
-    try:
-        games = fetch_odds()
-        cands = pick_candidates(games)
+# -------------------------------
+# RUN
+# -------------------------------
+if st.button("Run Model"):
+    games = fetch_odds()
+    cands = pick_candidates(games)
 
-        # Filter by EV threshold
-        cands = [c for c in cands if float(c["ev"]) >= float(min_ev)]
-        cands.sort(key=lambda x: float(x["ev"]), reverse=True)
+    cands.sort(key=lambda x: x["ev"], reverse=True)
+    filtered = [c for c in cands if c["ev"] >= min_ev]
 
-        picks = cands[: int(max_picks)]
+    if not filtered:
+        best = max(cands, key=lambda x: x["ev"])
+        st.warning(
+            f"PASS — Best edge found was {best['ev']:.3f} per $1, below your {min_ev:.3f} threshold."
+        )
+    else:
+        st.subheader("Ranked Bets (Best → Worst)")
 
-        if not picks:
-            st.warning("PASS — No bets meet your minimum EV (edge) threshold.")
-        else:
-            bankroll = float(daily_bankroll)
+        picks = filtered[:max_picks]
+        stake = daily_bankroll / len(picks)
 
-            # Determine stakes
-            if stake_method == "Flat (even split)":
-                stakes = stake_split(int(bankroll), len(picks))
-                stakes = [float(x) for x in stakes]
-            else:
-                raw_fractions = []
-                for p in picks:
-                    odds = int(p["odds"])
-                    b = profit_per_1_stake(odds)
-                    ev = float(p["ev"])
-
-                    # derive p_true from EV and odds
-                    # EV = p_true*(b+1) - 1  -> p_true = (EV+1)/(b+1)
-                    p_true = (ev + 1.0) / (b + 1.0)
-                    p_true = max(0.01, min(0.99, p_true))
-
-                    f = kelly_fraction(p_true, odds)
-
-                    if stake_method == "Half Kelly":
-                        f *= 0.5
-                    else:  # Quarter Kelly
-                        f *= 0.25
-
-                    # Safety clamp: max 25% of daily bankroll on any single play
-                    f = min(f, 0.25)
-                    raw_fractions.append(f)
-
-                total_f = sum(raw_fractions)
-
-                if total_f <= 0:
-                    stakes = stake_split(int(bankroll), len(picks))
-                    stakes = [float(x) for x in stakes]
-                else:
-                    stakes = [(f / total_f) * bankroll for f in raw_fractions]
-
-            st.subheader("Today’s Picks")
-            st.caption("ML = pick the team to win the game (OT/SO counts). PL = puck line spread.")
-
-            for i, (p, stake) in enumerate(zip(picks, stakes), start=1):
-                odds = int(p["odds"])
-                stake = float(stake)
-
-                # Book implied probability
-                imp = implied_prob_from_odds(odds)
-
-                # Payout math
-                total_return = payout_from_odds(stake, odds)
-                profit_if_win = total_return - stake
-                loss_if_lose = stake
-
-                # EV math
-                ev_per_1 = float(p["ev"])
-                ev_dollars = ev_per_1 * stake
-                ev_line = f"+${ev_dollars:.2f}" if ev_dollars >= 0 else f"-${abs(ev_dollars):.2f}"
-
-                with st.container(border=True):
-                    st.markdown(f"### {i}. {p['pick']} ({p['market']}) {odds} @ {p['book']}")
-                    st.markdown(f"**Game:** {p['matchup']}")
-                    st.markdown(f"**Start:** {p['start_time']}")
-                    st.markdown(f"**Bet:** ${stake:.0f} on **{p['pick']}**")
-
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Implied win %", f"{imp*100:.1f}%")
-                    c2.metric("Profit if win", f"${profit_if_win:.2f}")
-                    c3.metric("Loss if lose", f"-${loss_if_lose:.2f}")
-                    c4.metric("EV (this bet)", ev_line)
-
-                    st.caption(
-                        f"Edge setting = {float(min_ev):.3f} EV per $1. "
-                        f"This pick’s EV per $1 = {ev_per_1:.3f}."
-                    )
-
-    except requests.HTTPError as e:
-        st.error(f"Odds API error: {e}")
-    except Exception as e:
-        st.error(f"Unexpected error: {e}")
+        for i, p in enumerate(picks, start=1):
+            with st.container(border=True):
+                st.markdown(
+                    f"### {i}. {p['pick']} ({p['market']}) {p['odds']} @ {p['book']} — **{confidence_label(p['ev'])}**"
+                )
+                st.markdown(f"**Stake:** ${stake:.0f}")
+                st.markdown(f"**Expected Value:** +${p['ev'] * stake:.2f}")
