@@ -1,6 +1,8 @@
 import os
 import requests
 import streamlit as st
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # -----------------------------
 # Helpers (display + math)
@@ -57,6 +59,18 @@ def kelly_fraction(p_true: float, odds: int) -> float:
     f = (b * p_true - q) / b
     return max(0.0, f)
 
+def format_commence_time(iso_str: str) -> str:
+    """Convert ISO commence_time to America/Chicago display string."""
+    if not iso_str:
+        return "Time TBD"
+    try:
+        # Odds API usually returns 'Z' for UTC
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        dt_ct = dt.astimezone(ZoneInfo("America/Chicago"))
+        return dt_ct.strftime("%b %d, %I:%M %p CT").replace(" 0", " ")
+    except Exception:
+        return iso_str
+
 # -----------------------------
 # App config
 # -----------------------------
@@ -87,8 +101,13 @@ def pick_candidates(games_json):
     candidates = []
 
     for g in games_json:
+        game_id = g.get("id")
         home = g.get("home_team")
         away = g.get("away_team")
+        commence = g.get("commence_time")
+        matchup = f"{away} @ {home}" if away and home else "Matchup TBD"
+        start_ct = format_commence_time(commence)
+
         books = g.get("bookmakers", []) or []
 
         # ----- MONEYLINE -----
@@ -173,6 +192,9 @@ def pick_candidates(games_json):
                     odds = best["odds"]
                     ev = ev_per_1_stake(p_true, odds)
                     candidates.append({
+                        "game_id": game_id,
+                        "matchup": matchup,
+                        "start_time": start_ct,
                         "market": "ML",
                         "pick": f"{team} ML",
                         "odds": odds,
@@ -193,8 +215,11 @@ def pick_candidates(games_json):
                     odds = best["odds"]
                     ev = ev_per_1_stake(p_true, odds)
                     candidates.append({
+                        "game_id": game_id,
+                        "matchup": matchup,
+                        "start_time": start_ct,
                         "market": "PL",
-                        "pick": k,
+                        "pick": f"{k}",
                         "odds": odds,
                         "book": best["book"],
                         "ev": ev
@@ -217,12 +242,11 @@ def stake_split(total: int, n: int):
 # UI
 # -----------------------------
 st.title("🏒 NHL Picks")
-st.caption("Pregame only • Picks only • Moneyline + Puck line • Top 1–3 by edge")
+st.caption("Pregame only • Moneyline + Puck line • Top 1–3 by edge")
 
 daily_bankroll = st.number_input("Daily bankroll ($)", min_value=10, max_value=1000, value=100, step=10)
 min_ev = st.slider("Minimum EV (edge) per $1 stake", min_value=0.00, max_value=0.10, value=0.03, step=0.005)
 max_picks = st.selectbox("Max picks", options=[1, 2, 3], index=2)
-
 stake_method = st.selectbox("Stake method", ["Flat (even split)", "Half Kelly", "Quarter Kelly"], index=0)
 
 if not API_KEY:
@@ -256,7 +280,7 @@ if st.button("Run Picks"):
                     b = profit_per_1_stake(odds)
                     ev = float(p["ev"])
 
-                    # derive implied p_true from EV and odds
+                    # derive p_true from EV and odds
                     # EV = p_true*(b+1) - 1  -> p_true = (EV+1)/(b+1)
                     p_true = (ev + 1.0) / (b + 1.0)
                     p_true = max(0.01, min(0.99, p_true))
@@ -281,7 +305,7 @@ if st.button("Run Picks"):
                     stakes = [(f / total_f) * bankroll for f in raw_fractions]
 
             st.subheader("Today’s Picks")
-            st.caption("Moneyline (ML) = pick the team to win the game (including OT/SO).")
+            st.caption("ML = pick the team to win the game (OT/SO counts). PL = puck line spread.")
 
             for i, (p, stake) in enumerate(zip(picks, stakes), start=1):
                 odds = int(p["odds"])
@@ -295,13 +319,15 @@ if st.button("Run Picks"):
                 profit_if_win = total_return - stake
                 loss_if_lose = stake
 
-                # EV math (your model's edge per $1)
-                ev_per_1 = float(p["ev"])  # ex: 0.01 = +$0.01 per $1 staked
+                # EV math
+                ev_per_1 = float(p["ev"])
                 ev_dollars = ev_per_1 * stake
                 ev_line = f"+${ev_dollars:.2f}" if ev_dollars >= 0 else f"-${abs(ev_dollars):.2f}"
 
                 with st.container(border=True):
                     st.markdown(f"### {i}. {p['pick']} ({p['market']}) {odds} @ {p['book']}")
+                    st.markdown(f"**Game:** {p['matchup']}")
+                    st.markdown(f"**Start:** {p['start_time']}")
                     st.markdown(f"**Bet:** ${stake:.0f} on **{p['pick']}**")
 
                     c1, c2, c3, c4 = st.columns(4)
