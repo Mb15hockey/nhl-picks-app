@@ -45,6 +45,18 @@ def ev_per_1_stake(p_true: float, odds: int) -> float:
     profit = profit_per_1_stake(odds)
     return p_true * profit - (1 - p_true)
 
+def kelly_fraction(p_true: float, odds: int) -> float:
+    """
+    Kelly fraction for American odds.
+    Returns fraction of bankroll to bet (0–1).
+    """
+    b = profit_per_1_stake(odds)  # net profit per $1
+    q = 1 - p_true
+    if b <= 0:
+        return 0.0
+    f = (b * p_true - q) / b
+    return max(0.0, f)
+
 # -----------------------------
 # App config
 # -----------------------------
@@ -191,6 +203,7 @@ def pick_candidates(games_json):
     return candidates
 
 def stake_split(total: int, n: int):
+    """Even split (flat staking)."""
     if n <= 0:
         return []
     if n == 1:
@@ -210,6 +223,8 @@ daily_bankroll = st.number_input("Daily bankroll ($)", min_value=10, max_value=1
 min_ev = st.slider("Minimum EV (edge) per $1 stake", min_value=0.00, max_value=0.10, value=0.03, step=0.005)
 max_picks = st.selectbox("Max picks", options=[1, 2, 3], index=2)
 
+stake_method = st.selectbox("Stake method", ["Flat (even split)", "Half Kelly", "Quarter Kelly"], index=0)
+
 if not API_KEY:
     st.error("ODDS_API_KEY is not set in Railway Variables.")
     st.stop()
@@ -228,7 +243,42 @@ if st.button("Run Picks"):
         if not picks:
             st.warning("PASS — No bets meet your minimum EV (edge) threshold.")
         else:
-            stakes = stake_split(int(daily_bankroll), len(picks))
+            bankroll = float(daily_bankroll)
+
+            # Determine stakes
+            if stake_method == "Flat (even split)":
+                stakes = stake_split(int(bankroll), len(picks))
+                stakes = [float(x) for x in stakes]
+            else:
+                raw_fractions = []
+                for p in picks:
+                    odds = int(p["odds"])
+                    b = profit_per_1_stake(odds)
+                    ev = float(p["ev"])
+
+                    # derive implied p_true from EV and odds
+                    # EV = p_true*(b+1) - 1  -> p_true = (EV+1)/(b+1)
+                    p_true = (ev + 1.0) / (b + 1.0)
+                    p_true = max(0.01, min(0.99, p_true))
+
+                    f = kelly_fraction(p_true, odds)
+
+                    if stake_method == "Half Kelly":
+                        f *= 0.5
+                    else:  # Quarter Kelly
+                        f *= 0.25
+
+                    # Safety clamp: max 25% of daily bankroll on any single play
+                    f = min(f, 0.25)
+                    raw_fractions.append(f)
+
+                total_f = sum(raw_fractions)
+
+                if total_f <= 0:
+                    stakes = stake_split(int(bankroll), len(picks))
+                    stakes = [float(x) for x in stakes]
+                else:
+                    stakes = [(f / total_f) * bankroll for f in raw_fractions]
 
             st.subheader("Today’s Picks")
             st.caption("Moneyline (ML) = pick the team to win the game (including OT/SO).")
