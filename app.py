@@ -11,18 +11,16 @@ import streamlit as st
 API_KEY = os.getenv("ODDS_API_KEY", "").strip()
 DB_PATH = os.getenv("DB_PATH", "app.db")
 
-# Popular pro leagues
-LEAGUES = {
+# Main hockey leagues (NHL + 4) — you can swap these later if you want
+LEAGUES_PRO_MIX = {
     "NHL": "icehockey_nhl",
     "AHL": "icehockey_ahl",
     "SHL (Sweden)": "icehockey_sweden_hockey_league",
     "HockeyAllsvenskan (Sweden)": "icehockey_sweden_allsvenskan",
     "Liiga (Finland)": "icehockey_liiga",
-    # Optional later:
-    # "Mestis (Finland)": "icehockey_mestis",
 }
 
-PRO_MIX_5 = ["NHL", "AHL", "SHL (Sweden)", "HockeyAllsvenskan (Sweden)", "Liiga (Finland)"]
+LEAGUES_NHL_ONLY = {"NHL": "icehockey_nhl"}
 
 # Tune over time. Defaults to 1.0 if not listed.
 BOOK_WEIGHTS = {
@@ -92,8 +90,8 @@ def stake_split_kelly_scaled(total: int, picks: list, kelly_fraction: float):
     """
     Fractional Kelly sizing using p_true (model) and odds.
     kelly_fraction:
-      0.25 = quarter Kelly (conservative)
-      0.50 = half Kelly (balanced)
+      0.25 = Conservative
+      0.50 = Balanced
     Caps single bet at 60% of bankroll as a safety guard.
     """
     bankroll = float(total)
@@ -106,6 +104,7 @@ def stake_split_kelly_scaled(total: int, picks: list, kelly_fraction: float):
         dec = odds_to_decimal(odds)
         b = dec - 1.0
         q = 1.0 - p_true
+
         if b <= 0:
             f_star = 0.0
         else:
@@ -123,10 +122,12 @@ def stake_split_kelly_scaled(total: int, picks: list, kelly_fraction: float):
     raw_stakes = [bankroll * (f / s) for f in raw_fs]
     stakes = [int(round(x)) for x in raw_stakes]
 
+    # rounding correction
     while sum(stakes) > total and any(x > 0 for x in stakes):
         i = stakes.index(max(stakes))
         stakes[i] -= 1
 
+    # ensure at least $1 if possible
     for i in range(len(stakes)):
         if stakes[i] == 0 and total >= len(stakes):
             stakes[i] = 1
@@ -146,7 +147,7 @@ def fair_american_from_p(p: float) -> int:
 def slate_quality_and_plan(qualified_sorted, daily_bankroll: int):
     """
     Uses TOP 8 qualified bets to score slate. EV is per $1.
-    Returns: (quality_str, ev_sum_topk, suggested_bets_tonight, suggested_bet_sizing, bankroll_to_use)
+    Returns: (quality_str, ev_sum_topk, suggested_max_bets, suggested_bet_sizing, bankroll_to_use)
     """
     n = len(qualified_sorted)
     topk = min(8, n)
@@ -157,24 +158,24 @@ def slate_quality_and_plan(qualified_sorted, daily_bankroll: int):
 
     if thin:
         quality = "THIN"
-        suggested_bets_tonight = min(3, n) if n > 0 else 0
-        suggested_bet_sizing = "Quarter Kelly (conservative)"
+        suggested_max_bets = min(3, n) if n > 0 else 0
+        suggested_bet_sizing = "Conservative"
         bankroll_use_ratio = 0.80
     elif rich:
         quality = "RICH"
-        suggested_bets_tonight = min(10, n) if n > 0 else 0
-        suggested_bet_sizing = "Flat (even split)"
+        suggested_max_bets = min(10, n) if n > 0 else 0
+        suggested_bet_sizing = "Even bets"
         bankroll_use_ratio = 1.00
     else:
         quality = "NORMAL"
-        suggested_bets_tonight = min(8, n) if n > 0 else 0
-        suggested_bet_sizing = "Flat (even split)"
+        suggested_max_bets = min(8, n) if n > 0 else 0
+        suggested_bet_sizing = "Even bets"
         bankroll_use_ratio = 1.00
 
     bankroll_to_use = int(round(daily_bankroll * bankroll_use_ratio))
     bankroll_to_use = max(0, bankroll_to_use)
 
-    return quality, ev_sum, suggested_bets_tonight, suggested_bet_sizing, bankroll_to_use
+    return quality, ev_sum, suggested_max_bets, suggested_bet_sizing, bankroll_to_use
 
 # =========================================================
 # DB LAYER
@@ -186,6 +187,11 @@ def db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
+
+def _ensure_column(conn, table: str, column: str, col_def_sql: str):
+    cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_def_sql}")
 
 def init_db():
     conn = db()
@@ -204,6 +210,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS bets (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       placed_ts_utc TEXT NOT NULL,
+      league TEXT,
       game_id TEXT NOT NULL,
       game TEXT NOT NULL,
       market TEXT NOT NULL,
@@ -220,6 +227,9 @@ def init_db():
     )
     """)
 
+    # Backward compat: if older DB exists without league column
+    _ensure_column(conn, "bets", "league", "league TEXT")
+
     conn.commit()
     conn.close()
 
@@ -232,18 +242,19 @@ def save_snapshot(games, sport: str):
     conn.commit()
     conn.close()
 
-def save_bets(to_bet, bets):
+def save_bets(to_bet, bet_amounts):
     conn = db()
-    for c, s in zip(to_bet, bets):
+    for c, amt in zip(to_bet, bet_amounts):
         conn.execute("""
         INSERT INTO bets (
-          placed_ts_utc, game_id, game, market, pick, book,
+          placed_ts_utc, league, game_id, game, market, pick, book,
           odds_placed, p_true, ev, stake
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             now_utc_iso(),
+            c.get("league"),
             c["game_id"], c["game"], c["market"], c["pick"], c["book"],
-            int(c["odds"]), float(c["p_true"]), float(c["ev"]), int(s)
+            int(c["odds"]), float(c["p_true"]), float(c["ev"]), int(amt)
         ))
     conn.commit()
     conn.close()
@@ -492,24 +503,48 @@ def pick_candidates(games, league_label: str):
     return candidates
 
 # =========================================================
-# CLV UPDATER (NHL ONLY FOR NOW)
+# CLV UPDATER (MULTI-LEAGUE)
 # =========================================================
 def find_best_odds_for_bet(cands, bet_row):
     for c in cands:
-        if c["game_id"] == bet_row["game_id"] and c["market"] == bet_row["market"] and c["pick"] == bet_row["pick"]:
+        if (
+            c["game_id"] == bet_row["game_id"]
+            and c["market"] == bet_row["market"]
+            and c["pick"] == bet_row["pick"]
+        ):
             return int(c["odds"])
     return None
 
-def update_closing_lines_for_open_bets():
-    games = fetch_odds(LEAGUES["NHL"])
-    save_snapshot(games, sport=LEAGUES["NHL"])
-    cands = pick_candidates(games, league_label="NHL")
-
+def update_closing_lines_for_open_bets(league_map: dict):
+    """
+    Fetches odds per league that appears in OPEN bets, then updates close_odds + clv_cents.
+    This runs only when user clicks the button, so extra API calls are intentional.
+    """
     conn = db()
     open_bets = conn.execute("SELECT * FROM bets WHERE status='OPEN'").fetchall()
+    conn.close()
+
+    leagues_in_open = sorted({(b["league"] or "NHL") for b in open_bets})
+    if not leagues_in_open:
+        return 0
+
+    # fetch + build candidates per league once
+    cand_by_league = {}
+    for lg in leagues_in_open:
+        sport_key = league_map.get(lg)
+        if not sport_key:
+            continue
+        games = fetch_odds(sport_key)
+        save_snapshot(games, sport=sport_key)
+        cand_by_league[lg] = pick_candidates(games, league_label=lg)
 
     updated = 0
+    conn = db()
     for b in open_bets:
+        lg = (b["league"] or "NHL")
+        cands = cand_by_league.get(lg)
+        if not cands:
+            continue
         close = find_best_odds_for_bet(cands, b)
         if close is None:
             continue
@@ -534,24 +569,71 @@ init_db()
 # =========================================================
 st.set_page_config(page_title="Myles’s Professional Hockey Picks", page_icon="🏒", layout="centered")
 
+# Styles: cards, headers, helper text, nicer button
 st.markdown(
-    "<style>"
-    ".badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:700;"
-    "border:1px solid rgba(255,255,255,0.15);}"
-    ".badge-thin{background:rgba(255,193,7,0.15);}"
-    ".badge-normal{background:rgba(13,202,240,0.15);}"
-    ".badge-rich{background:rgba(25,135,84,0.15);}"
-    ".badge-edge{background:rgba(25,135,84,0.20);}"
-    ".badge-strong{background:rgba(25,135,84,0.18);}"
-    ".badge-med{background:rgba(255,193,7,0.15);}"
-    ".badge-small{background:rgba(108,117,125,0.12);}"
-    ".muted{opacity:0.85;}"
-    "</style>",
+    """
+<style>
+/* Section cards */
+.section-card {
+    background: linear-gradient(180deg, rgba(18,24,38,1) 0%, rgba(11,15,20,1) 100%);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 16px;
+    padding: 18px 20px;
+    margin: 14px 0 18px 0;
+}
+
+/* Section title */
+.section-title {
+    font-size: 18px;
+    font-weight: 900;
+    margin-bottom: 8px;
+}
+
+/* Helper/muted text */
+.helper {
+    color: rgba(229,231,235,0.70);
+    font-size: 13px;
+    margin-top: 6px;
+}
+
+/* Badges */
+.badge{
+    display:inline-block;
+    padding:3px 10px;
+    border-radius:999px;
+    font-size:12px;
+    font-weight:800;
+    border:1px solid rgba(255,255,255,0.12);
+}
+.badge-thin{background:rgba(255,193,7,0.15);}
+.badge-normal{background:rgba(13,202,240,0.15);}
+.badge-rich{background:rgba(25,135,84,0.15);}
+.badge-edge{background:rgba(225,29,72,0.18);}
+.badge-strong{background:rgba(25,135,84,0.16);}
+.badge-med{background:rgba(255,193,7,0.14);}
+.badge-small{background:rgba(156,163,175,0.10);}
+
+/* Primary buttons */
+.stButton>button {
+    background: linear-gradient(135deg, #E11D48, #BE123C) !important;
+    border: 0 !important;
+    border-radius: 14px !important;
+    font-weight: 900 !important;
+    padding: 0.60rem 1.15rem !important;
+}
+</style>
+""",
     unsafe_allow_html=True,
 )
 
-st.markdown("# 🏒 Myles’s Professional Hockey Picks")
-st.markdown("*Pregame only · Ranked best → worst · Moneyline · Puck Line · Totals*")
+st.markdown(
+    "<div style='font-size:34px;font-weight:950;line-height:1.05;'>🏒 Myles’s Professional Hockey Picks</div>",
+    unsafe_allow_html=True,
+)
+st.markdown(
+    "<div class='helper' style='font-size:14px;'>Pregame only · Ranked best → worst · Moneyline · Puck Line · Totals</div>",
+    unsafe_allow_html=True,
+)
 st.caption(f"Updated {date.today().strftime('%B %d, %Y')}")
 st.divider()
 
@@ -561,203 +643,134 @@ if not API_KEY:
 
 tab_picks, tab_tracker = st.tabs(["Picks", "Tracker"])
 
+# session state for saving after run
 st.session_state.setdefault("last_to_bet", [])
 st.session_state.setdefault("last_bets", [])
 st.session_state.setdefault("last_ranked", [])
 st.session_state.setdefault("last_plan", None)
 
-# -----------------------
+# =========================================================
 # PICKS TAB
-# -----------------------
+# =========================================================
 with tab_picks:
-    colL, colR = st.columns(2)
+    # SECTION 1 — Betting Universe
+    st.markdown("<div class='section-card'>", unsafe_allow_html=True)
+    st.markdown("<div class='section-title'>1) Betting universe</div>", unsafe_allow_html=True)
 
-    with colL:
-        edge_filter = st.radio(
-            "How picky should we be?",
-            ["Loose (more bets)", "Balanced", "Strict (fewer bets)"],
-            index=1,
-            horizontal=True,
-        )
-
-        coverage = st.radio(
-            "Which leagues should we include?",
-            ["NHL only", "Pro Mix (NHL + 4 leagues)"],
-            index=1,
-            horizontal=True,
-        )
-
-        only_bov = st.toggle("Only show Bovada lines", value=False)
-        st.caption("All qualifying bets will be shown (ranked). Bet amounts are only shown for the bets you place tonight.")
-
-    with colR:
-        auto_mode = st.toggle("Auto mode (recommended)", value=True)
-
-        bets_tonight = st.slider(
-            "How many bets do you want to place tonight?",
-            1, 10, 6
-        )
-
-        daily_bankroll = st.number_input(
-            "Tonight’s bankroll ($)",
-            min_value=10, max_value=5000, value=100, step=10
-        )
-
-        bet_sizing_manual = st.radio(
-            "Bet sizing",
-            ["Flat (even split)", "Quarter Kelly (conservative)", "Half Kelly (balanced)"],
-            index=0,
-            horizontal=True,
-            disabled=auto_mode,
-        )
-
-        bankroll_use_manual = st.selectbox(
-            "Max bankroll to use",
-            ["Auto", "100%", "80%", "60%"],
-            index=0,
-            disabled=auto_mode,
-        )
-
-    # League selection via toggle (cap at 5 total)
-    if coverage == "NHL only":
-        selected_leagues = ["NHL"]
-    else:
-        selected_leagues = [x for x in PRO_MIX_5 if x in LEAGUES]
-        if "NHL" not in selected_leagues:
-            selected_leagues = ["NHL"]
-
-    EV_MAP = {"Loose (more bets)": 0.015, "Balanced": 0.025, "Strict (fewer bets)": 0.035}
-    min_ev = float(EV_MAP[edge_filter])
-
-    with st.expander("What do these numbers mean?", expanded=False):
-        st.caption("**Model win%** = our estimated chance the bet wins.")
-        st.caption("**Implied win%** = what the odds imply (before vig).")
-        st.caption("**Edge (pp)** = Model win% − Implied win% (percentage points).")
-        st.caption("**EV%** = expected return over many bets (not guaranteed).")
-        st.markdown("- 🟢 **STRONG** ≥ 5.0% EV\n- 🟡 **MEDIUM** ≥ 3.0% EV\n- ⚪ **SMALL** ≥ 1.5% EV\n- 💤 **TINY** < 1.5% EV")
-
-    books_txt = "Bovada only" if only_bov else "All"
-    leagues_txt = ", ".join(selected_leagues)
-    st.caption(
-        f"Minimum edge: **{min_ev*100:.1f}% EV** (≈ **${min_ev*100:.2f} per $100**) • "
-        f"Books: **{books_txt}** • Leagues: **{leagues_txt}**"
+    league_mode = st.radio(
+        "Which leagues should we include?",
+        ["NHL only", "Pro Mix (NHL + 4 pro leagues)"],
+        index=1,
+        horizontal=True,
     )
 
-    def _apply_filters_and_sort(rows, market_filter: str, league_filter: str, sort_mode: str):
-        out = rows
+    only_bov = st.toggle("Only show Bovada lines", value=False)
+    st.markdown("<div class='helper'>Tip: Bovada-only can be thinner on some nights.</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        if market_filter == "Moneyline":
-            out = [c for c in out if c.get("market") == "ML"]
-        elif market_filter == "Puck Line":
-            out = [c for c in out if c.get("market") == "PL"]
-        elif market_filter == "Totals":
-            out = [c for c in out if c.get("market") == "TOTAL"]
+    # SECTION 2 — Edge Filter
+    st.markdown("<div class='section-card'>", unsafe_allow_html=True)
+    st.markdown("<div class='section-title'>2) Edge filter</div>", unsafe_allow_html=True)
 
-        if league_filter != "All":
-            out = [c for c in out if c.get("league") == league_filter]
+    edge_filter = st.radio(
+        "How picky should we be?",
+        ["Loose (more plays)", "Balanced (recommended)", "Strict (fewer plays)"],
+        index=1,
+        horizontal=True,
+    )
 
-        def edge_pp(c):
-            p_model = float(c["p_true"])
-            p_impl = implied_prob_from_odds(int(c["odds"]))
-            return (p_model - p_impl) * 100.0
+    EV_MAP = {
+        "Loose (more plays)": 0.015,
+        "Balanced (recommended)": 0.025,
+        "Strict (fewer plays)": 0.035,
+    }
+    min_ev = float(EV_MAP[edge_filter])
 
-        if sort_mode == "Best EV":
-            out.sort(key=lambda x: float(x["ev"]), reverse=True)
-        elif sort_mode == "Biggest edge (pp)":
-            out.sort(key=edge_pp, reverse=True)
-        elif sort_mode == "Highest model win%":
-            out.sort(key=lambda x: float(x["p_true"]), reverse=True)
-        else:
-            out.sort(key=lambda x: float(x["ev"]), reverse=True)
+    st.markdown(
+        f"<div class='helper'>Minimum edge: <b>{min_ev*100:.1f}% EV</b> (≈ ${min_ev*100:.2f} per $100 long-run)</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        return out
+    # SECTION 3 — Tonight’s Plan
+    st.markdown("<div class='section-card'>", unsafe_allow_html=True)
+    st.markdown("<div class='section-title'>3) Tonight’s plan</div>", unsafe_allow_html=True)
 
-    def _render_cards(ranked_rows, to_bet_rows, bet_amounts):
-        for i, c in enumerate(ranked_rows, start=1):
-            ev1 = float(c["ev"])
-            ev_pct = ev1 * 100.0
+    daily_bankroll = st.number_input("Tonight’s bankroll ($)", min_value=10, max_value=5000, value=100, step=10)
+    max_bets_to_place = st.slider("How many bets do you want to place tonight?", 1, 12, 6)
 
-            p_model = float(c["p_true"])
-            p_implied = implied_prob_from_odds(int(c["odds"]))
-            edge_pp = (p_model - p_implied) * 100.0
+    auto_mode = st.toggle("Auto mode (recommended)", value=True)
 
-            label = confidence_label(ev1)
+    bet_sizing = st.radio(
+        "Bet sizing strategy",
+        ["Even bets", "Conservative", "Balanced (recommended)"],
+        index=2,
+        horizontal=True,
+        disabled=auto_mode,
+    )
 
-            is_bet = c in to_bet_rows
-            tag = "✅ BET TONIGHT" if is_bet else "👀 QUALIFIES"
+    bankroll_use_manual = st.selectbox(
+        "Max bankroll to use",
+        ["Auto", "100%", "80%", "60%"],
+        index=0,
+        disabled=auto_mode,
+    )
 
-            conf_class = {"STRONG": "badge-strong", "MEDIUM": "badge-med", "SMALL": "badge-small"}.get(label, "badge-small")
-            conf_badge = f'<span class="badge {conf_class}">{label}</span>'
+    with st.expander("What do these mean?", expanded=False):
+        st.write("**Even bets**: Same dollar amount on each bet.")
+        st.write("**Conservative**: Scales bet size with edge, but keeps bets smaller to reduce swings.")
+        st.write("**Balanced**: Scales bet size with edge while still protecting your bankroll (recommended).")
+        st.caption("Behind the scenes, these are professional bankroll-sizing models. No strategy guarantees wins.")
 
-            bet_html = ""
-            if is_bet:
-                amt = bet_amounts[to_bet_rows.index(c)]
-                bet_html = f' • <b>Bet: ${int(amt)}</b>'
+    st.markdown("</div>", unsafe_allow_html=True)
 
-            league_tag = f"[{c.get('league','—')}]"
+    # SECTION 4 — Run
+    st.markdown("<div class='section-card'>", unsafe_allow_html=True)
+    st.markdown("<div class='section-title'>4) Run picks</div>", unsafe_allow_html=True)
 
-            header_html = (
-                f"<div style='font-size:18px;font-weight:800;'>"
-                f"{i}. {tag} — {league_tag} {c['game']} — {c['pick']} ({c['market']}) "
-                f"{c['odds']} @ {c['book']} {conf_badge}"
-                f"<span class='muted'>{bet_html}</span>"
-                f"</div>"
-            )
+    # League map based on toggle
+    league_map = LEAGUES_NHL_ONLY if league_mode.startswith("NHL only") else LEAGUES_PRO_MIX
+    leagues_txt = ", ".join(list(league_map.keys()))
+    books_txt = "Bovada only" if only_bov else "All books"
 
-            sub_html = (
-                f"<div class='muted' style='margin-top:6px;'>"
-                f"EV: <b>+{ev_pct:.2f}%</b> (≈ <b>${ev_pct:.2f} per $100</b>) • "
-                f"Edge: <b>{edge_pp:+.1f}pp</b> • "
-                f"Model win%: <b>{p_model*100:.1f}%</b> • "
-                f"Implied win%: <b>{p_implied*100:.1f}%</b> • "
-                f"Books used: {c.get('n_books','—')}"
-                f"</div>"
-            )
+    st.markdown(
+        f"<div class='helper'>Leagues: <b>{leagues_txt}</b> · Books: <b>{books_txt}</b></div>",
+        unsafe_allow_html=True,
+    )
 
-            with st.container(border=True):
-                st.markdown(header_html + sub_html, unsafe_allow_html=True)
+    run_clicked = st.button("Run Model")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-                with st.expander("Why this bet?"):
-                    fair = fair_american_from_p(p_model)
-                    st.write(f"Fair odds (model): **{fair}**")
-                    st.write(f"Best available: **{c['odds']} @ {c['book']}**")
-                    st.write(f"Model win%: **{p_model*100:.1f}%**")
-                    st.write(f"Book implied win%: **{p_implied*100:.1f}%**")
-                    st.write(f"Win-prob edge: **{edge_pp:+.2f} percentage points**")
-                    st.write(f"EV (ROI): **+{ev_pct:.2f}%** (≈ **+${ev_pct:.2f} per $100**)")
-
-    if st.button("Run Model"):
-        # Pull all leagues requested
+    if run_clicked:
         all_cands = []
-        for lg in selected_leagues:
-            sport_key = LEAGUES[lg]
+        for lg, sport_key in league_map.items():
             games = fetch_odds(sport_key)
             save_snapshot(games, sport=sport_key)
             all_cands.extend(pick_candidates(games, league_label=lg))
 
-        cands = all_cands
-        if not cands:
+        if not all_cands:
             st.warning("PASS — no odds returned.")
             st.stop()
 
+        # Optional Bovada-only filter
+        cands = all_cands
         if only_bov:
             cands = [c for c in cands if is_bovada(c.get("book", ""))]
             if not cands:
-                st.warning("No Bovada lines found for this coverage. Turn off Bovada-only or change coverage.")
+                st.warning("No Bovada lines found for these leagues tonight. Turn off Bovada-only or try again later.")
                 st.stop()
 
-        # Sort all candidates by EV first (baseline)
+        # Rank by EV
         cands.sort(key=lambda x: float(x["ev"]), reverse=True)
         best_any = float(cands[0]["ev"])
 
+        # Qualify by edge filter
         qualified = [c for c in cands if float(c["ev"]) >= float(min_ev)]
         qualified.sort(key=lambda x: float(x["ev"]), reverse=True)
 
         if not qualified:
-            st.warning(
-                f"PASS — Best edge found was {best_any*100:.2f}% EV (below your {min_ev*100:.2f}% threshold)."
-            )
-            st.subheader("Closest opportunities (below threshold)")
+            st.warning(f"PASS — Best edge found was {best_any*100:.2f}% EV (below your {min_ev*100:.2f}% minimum).")
+            st.subheader("Closest plays (did NOT qualify)")
             for i, c in enumerate(cands[:8], start=1):
                 st.write(
                     f"{i}) [{c.get('league','—')}] {c['game']} — {c['pick']} ({c['market']}) "
@@ -765,45 +778,21 @@ with tab_picks:
                 )
             st.stop()
 
-        # --- Filters like a betting app ---
-        st.divider()
-        st.subheader("Filters")
+        # Show ALL qualifying bets (ranked)
+        ranked = qualified
 
-        filt1, filt2, filt3 = st.columns([1.3, 1.2, 1.5])
-        with filt1:
-            market_filter = st.radio(
-                "Market",
-                ["All", "Moneyline", "Puck Line", "Totals"],
-                index=0,
-                horizontal=True,
-            )
-        with filt2:
-            league_filter = st.selectbox(
-                "League",
-                ["All"] + selected_leagues,
-                index=0,
-            )
-        with filt3:
-            sort_mode = st.selectbox(
-                "Sort",
-                ["Best EV", "Biggest edge (pp)", "Highest model win%"],
-                index=0,
-            )
-
-        view = _apply_filters_and_sort(qualified, market_filter, league_filter, sort_mode)
-
-        # Slate plan & auto sizing should apply to the VIEW (what you're actually choosing bets from)
-        quality, ev_sum_topk, suggested_bets_tonight, suggested_bet_sizing, bankroll_to_use_auto = slate_quality_and_plan(
-            qualified_sorted=view,
+        quality, ev_sum_topk, suggested_max_bets, suggested_bet_sizing, bankroll_to_use_auto = slate_quality_and_plan(
+            qualified_sorted=qualified,
             daily_bankroll=int(daily_bankroll),
         )
 
+        # Decide bankroll + sizing
         if auto_mode:
-            bet_sizing = suggested_bet_sizing
-            bankroll_to_use = bankroll_to_use_auto
-            bets_effective = min(int(suggested_bets_tonight), int(bets_tonight)) if suggested_bets_tonight else 0
+            bankroll_to_use = int(bankroll_to_use_auto)
+            sizing_choice = suggested_bet_sizing
+            max_bets_effective = min(int(max_bets_to_place), int(suggested_max_bets or 0), len(ranked))
         else:
-            bet_sizing = bet_sizing_manual
+            sizing_choice = bet_sizing
             if bankroll_use_manual == "100%":
                 bankroll_to_use = int(daily_bankroll)
             elif bankroll_use_manual == "80%":
@@ -812,88 +801,121 @@ with tab_picks:
                 bankroll_to_use = int(round(daily_bankroll * 0.60))
             else:
                 bankroll_to_use = int(daily_bankroll)
-            bets_effective = min(int(bets_tonight), len(view))
+            max_bets_effective = min(int(max_bets_to_place), len(ranked))
 
-        to_bet = view[: int(bets_effective)]
+        to_bet = ranked[: int(max_bets_effective)]
 
-        if bet_sizing.startswith("Flat"):
+        # Convert sizing_choice to engine behavior
+        if sizing_choice == "Even bets":
             bet_amounts = stake_split_flat(int(bankroll_to_use), len(to_bet))
         else:
-            k_frac = 0.25 if "Quarter" in bet_sizing else 0.50
+            k_frac = 0.25 if sizing_choice == "Conservative" else 0.50
             bet_amounts = stake_split_kelly_scaled(int(bankroll_to_use), to_bet, kelly_fraction=k_frac)
 
-        st.session_state.last_ranked = view
+        st.session_state.last_ranked = ranked
         st.session_state.last_to_bet = to_bet
         st.session_state.last_bets = bet_amounts
         st.session_state.last_plan = {
             "quality": quality,
             "ev_sum_topk": ev_sum_topk,
-            "bet_sizing": bet_sizing,
+            "sizing_choice": sizing_choice,
             "bankroll_to_use": bankroll_to_use,
             "min_ev": min_ev,
             "only_bov": only_bov,
             "auto_mode": auto_mode,
-            "leagues": selected_leagues,
-            "market_filter": market_filter,
-            "league_filter": league_filter,
-            "sort_mode": sort_mode,
+            "league_mode": league_mode,
         }
 
         quality_class = {"THIN": "badge-thin", "NORMAL": "badge-normal", "RICH": "badge-rich"}.get(quality, "badge-normal")
         badges = (
-            f'<div class="muted">'
-            f'<span class="badge {quality_class}">SLATE: {quality}</span>&nbsp;'
-            f'<span class="badge">Qualifying (view): {len(view)}</span>&nbsp;'
-            f'<span class="badge">Betting tonight: {len(to_bet)}</span>&nbsp;'
-            f'<span class="badge">Bankroll used: ${int(bankroll_to_use)}</span>'
-            f'</div>'
+            f"<div>"
+            f"<span class='badge {quality_class}'>SLATE: {quality}</span>&nbsp;"
+            f"<span class='badge'>Qualifying: {len(qualified)}</span>&nbsp;"
+            f"<span class='badge'>Betting: {len(to_bet)}</span>&nbsp;"
+            f"<span class='badge'>Bankroll used: ${int(bankroll_to_use)}</span>&nbsp;"
+            f"<span class='badge'>Sizing: {sizing_choice}</span>"
+            f"</div>"
         )
         st.markdown(badges, unsafe_allow_html=True)
-
-        st.caption(f"Total edge (top 8 in view): **{ev_sum_topk*100:.2f}% EV** (bigger = more opportunity).")
-        if only_bov:
-            st.caption("Bovada-only is ON — some nights will be thinner.")
+        st.caption(f"Total edge score (top 8): **{ev_sum_topk:.3f} EV/$1** (bigger = more opportunity).")
         st.divider()
 
-        st.subheader(f"Ranked Opportunities — {len(view)} qualify in your current view")
-        st.caption(
-            f"Bet amounts are shown for the **{len(to_bet)} best opportunities** in this view. "
-            f"The rest still qualify but aren’t bet tonight."
-        )
+        st.subheader(f"Qualifying Plays — {len(qualified)} passed your edge filter")
+        st.caption("All qualifying plays are shown below (ranked best → worst). Bet amounts appear only on the bets you’re placing tonight.")
 
-        total_bet = sum(int(s) for s in bet_amounts) if bet_amounts else 0
+        total_bet = sum(int(x) for x in bet_amounts) if bet_amounts else 0
         unused = int(bankroll_to_use) - total_bet
         st.caption(f"Bankroll used: **${int(bankroll_to_use)}** • Bet: **${total_bet}** • Unused: **${unused}**")
 
-        _render_cards(view, to_bet, bet_amounts)
+        for i, c in enumerate(ranked, start=1):
+            ev1 = float(c["ev"])
+            ev_pct = ev1 * 100.0
+            label = confidence_label(ev1)
+
+            is_bet_pick = c in to_bet
+            tag = "✅ BET" if is_bet_pick else "👀 QUALIFIES"
+
+            conf_class = {"STRONG": "badge-strong", "MEDIUM": "badge-med", "SMALL": "badge-small"}.get(label, "badge-small")
+            conf_badge = f"<span class='badge {conf_class}'>{label}</span>"
+            edge_badge = f" <span class='badge badge-edge'>TOP EDGE</span>" if (label == "STRONG" and i == 1) else ""
+
+            bet_html = ""
+            if is_bet_pick:
+                amt = bet_amounts[to_bet.index(c)]
+                bet_html = f" · <b>Bet: ${int(amt)}</b>"
+
+            header_html = (
+                f"<div style='font-size:18px;font-weight:900;'>"
+                f"{i}. {tag} — [{c.get('league','—')}] {c['game']} — {c['pick']} ({c['market']}) "
+                f"{c['odds']} @ {c['book']} {conf_badge}{edge_badge}"
+                f"</div>"
+            )
+            sub_html = (
+                f"<div class='helper'>"
+                f"Edge: <b>{ev_pct:.2f}% EV</b>{bet_html} · Books used: {c.get('n_books','—')}"
+                f"</div>"
+            )
+
+            with st.container(border=True):
+                st.markdown(header_html + sub_html, unsafe_allow_html=True)
+                with st.expander("Why this play?", expanded=False):
+                    fair = fair_american_from_p(float(c["p_true"]))
+                    st.write(f"Fair (no-vig) line: **{fair}**")
+                    st.write(f"Best available: **{c['odds']} @ {c['book']}**")
+                    st.write(f"Model p_true: **{float(c['p_true']):.3f}**")
+                    st.write(f"EV: **{ev_pct:.2f}%** (≈ **${float(c['ev']) * 100:.2f} per $100** long-run)")
 
         st.divider()
         st.subheader("Action")
-        if st.button("Save these bets to Tracker"):
+        if st.button("Save tonight’s bets to Tracker"):
             if not st.session_state.last_to_bet:
-                st.warning("No bets to save (either slate is thin or you chose too few bets tonight).")
+                st.warning("No bets selected to save (either slate is thin or your bet count is too low).")
             else:
                 save_bets(st.session_state.last_to_bet, st.session_state.last_bets)
                 st.success("Saved! Go to the Tracker tab to view CLV and results.")
 
-# -----------------------
+# =========================================================
 # TRACKER TAB
-# -----------------------
+# =========================================================
 with tab_tracker:
     st.subheader("Bet Tracker (CLV + Results)")
     st.caption("Update closing lines near game time to measure CLV. Mark results manually (MVP).")
 
+    # Use the PRO mix map so we can resolve league->sport_key in tracker updates
+    # (If you later change your Pro Mix list, update this map accordingly.)
+    league_map_for_tracker = LEAGUES_PRO_MIX.copy()
+
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Update closing lines (CLV) for OPEN bets"):
-            n = update_closing_lines_for_open_bets()
+            n = update_closing_lines_for_open_bets(league_map_for_tracker)
             st.success(f"Updated closing lines for {n} open bets.")
     with col2:
         st.write("")
 
     conn = db()
     rows = conn.execute("""
-      SELECT id, placed_ts_utc, game, market, pick, book,
+      SELECT id, placed_ts_utc, league, game, market, pick, book,
              odds_placed, stake, close_odds, clv_cents, status
       FROM bets
       ORDER BY id DESC
@@ -915,8 +937,9 @@ with tab_tracker:
 
         for r in rows:
             with st.container(border=True):
-                st.markdown(f"**{r['game']}** — {r['pick']} ({r['market']})")
-                st.caption(f"Placed: {r['placed_ts_utc']} • Book: {r['book']} • Bet: ${r['stake']}")
+                lg = r["league"] if r["league"] else "NHL"
+                st.markdown(f"**[{lg}] {r['game']}** — {r['pick']} ({r['market']})")
+                st.caption(f"Placed: {r['placed_ts_utc']} · Book: {r['book']} · Bet: ${r['stake']}")
 
                 if r["clv_cents"] is not None:
                     st.write(
@@ -925,14 +948,14 @@ with tab_tracker:
                         f"CLV: **{r['clv_cents']:.2f}** cents"
                     )
                 else:
-                    st.write("Odds placed: **{0}** | Close: **—** | CLV: **—**".format(r["odds_placed"]))
+                    st.write(f"Odds placed: **{r['odds_placed']}** | Close: **—** | CLV: **—**")
 
                 status = st.selectbox(
-                    "Set status",
+                    "Set result",
                     ["OPEN", "WIN", "LOSS", "PUSH", "VOID"],
                     index=["OPEN", "WIN", "LOSS", "PUSH", "VOID"].index(r["status"]),
                     key=f"status_{r['id']}",
                 )
-                if st.button("Save status", key=f"save_status_{r['id']}"):
+                if st.button("Save result", key=f"save_status_{r['id']}"):
                     update_bet_status(int(r["id"]), status)
-                    st.success("Status updated.")
+                    st.success("Updated.")
