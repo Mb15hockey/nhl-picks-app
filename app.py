@@ -18,7 +18,7 @@ LEAGUES = {
     "SHL (Sweden)": "icehockey_sweden_hockey_league",
     "HockeyAllsvenskan (Sweden)": "icehockey_sweden_allsvenskan",
     "Liiga (Finland)": "icehockey_liiga",
-    # Optional add later:
+    # Optional later:
     # "Mestis (Finland)": "icehockey_mestis",
 }
 
@@ -43,7 +43,7 @@ def is_bovada(book: str) -> bool:
     if not book:
         return False
     b = str(book).strip().lower()
-    return (b == "bovada") or ("bovada" in b)
+    return b == "bovada" or "bovada" in b
 
 def implied_prob_from_odds(odds: int) -> float:
     if odds > 0:
@@ -51,7 +51,6 @@ def implied_prob_from_odds(odds: int) -> float:
     return abs(odds) / (abs(odds) + 100.0)
 
 def profit_per_1_stake(odds: int) -> float:
-    # profit (not return) per $1 stake
     if odds > 0:
         return odds / 100.0
     return 100.0 / abs(odds)
@@ -63,7 +62,7 @@ def devig_two_way(p1, p2):
     s = p1 + p2
     return (p1 / s, p2 / s) if s > 0 else (0.5, 0.5)
 
-def confidence_label(ev):
+def confidence_label(ev: float) -> str:
     if ev >= 0.05:
         return "STRONG"
     if ev >= 0.03:
@@ -111,8 +110,8 @@ def stake_split_kelly_scaled(total: int, picks: list, kelly_fraction: float):
             f_star = (b * p_true - q) / b  # full Kelly
             f_star = max(0.0, f_star)
 
-        f_star *= float(kelly_fraction)      # quarter/half Kelly
-        f_star = min(f_star, cap_per_pick)   # cap
+        f_star *= float(kelly_fraction)
+        f_star = min(f_star, cap_per_pick)
         raw_fs.append(f_star)
 
     s = sum(raw_fs)
@@ -122,12 +121,10 @@ def stake_split_kelly_scaled(total: int, picks: list, kelly_fraction: float):
     raw_stakes = [bankroll * (f / s) for f in raw_fs]
     stakes = [int(round(x)) for x in raw_stakes]
 
-    # correct rounding overflow
     while sum(stakes) > total and any(x > 0 for x in stakes):
         i = stakes.index(max(stakes))
         stakes[i] -= 1
 
-    # ensure at least $1 if possible
     for i in range(len(stakes)):
         if stakes[i] == 0 and total >= len(stakes):
             stakes[i] = 1
@@ -138,7 +135,6 @@ def stake_split_kelly_scaled(total: int, picks: list, kelly_fraction: float):
     return stakes
 
 def fair_american_from_p(p: float) -> int:
-    # convert true probability to fair American odds (no vig)
     p = min(max(p, 1e-6), 1 - 1e-6)
     dec = 1.0 / p
     if dec >= 2.0:
@@ -217,7 +213,7 @@ def init_db():
       stake INTEGER NOT NULL,
       close_odds INTEGER,
       clv_cents REAL,
-      status TEXT DEFAULT 'OPEN',     -- OPEN/WIN/LOSS/PUSH/VOID
+      status TEXT DEFAULT 'OPEN',
       settled_ts_utc TEXT
     )
     """)
@@ -275,7 +271,7 @@ def fetch_odds(sport_key: str):
     params = {
         "apiKey": API_KEY,
         "regions": "us",
-        "markets": "h2h,spreads,totals",  # ML + PL + TOTALS
+        "markets": "h2h,spreads,totals",
         "oddsFormat": "american",
     }
     r = requests.get(url, params=params, timeout=20)
@@ -304,17 +300,14 @@ def pick_candidates(games, league_label: str):
         if not home or not away or not game_id:
             continue
 
-        # --- ML ---
-        ml_probs = []  # list of (p_home_true, p_away_true, weight)
+        ml_probs = []
         ml_best = {home: None, away: None}
 
-        # --- PL ---
-        pl_probs = {}  # line_id -> list of (p1_true, p2_true, k1, k2, weight)
-        pl_best = {}   # line_id -> { k -> {odds, book} }
+        pl_probs = {}
+        pl_best = {}
 
-        # --- TOTALS ---
-        tot_probs = {}  # total_point -> list of (p_over_true, p_under_true, over_key, under_key, weight)
-        tot_best = {}   # total_point -> { key -> {odds, book} }
+        tot_probs = {}
+        tot_best = {}
 
         for b in books:
             book_name = b.get("title") or b.get("key") or "book"
@@ -328,7 +321,7 @@ def pick_candidates(games, league_label: str):
 
                 o1, o2 = outcomes[0], outcomes[1]
 
-                # ---------- MONEYLINE ----------
+                # MONEYLINE
                 if mkey == "h2h":
                     n1, n2 = o1.get("name"), o2.get("name")
                     p1, p2 = o1.get("price"), o2.get("price")
@@ -352,7 +345,7 @@ def pick_candidates(games, league_label: str):
                             if ml_best[nm] is None or od > ml_best[nm]["odds"]:
                                 ml_best[nm] = {"odds": od, "book": book_name}
 
-                # ---------- PUCK LINE ----------
+                # SPREADS / PUCK LINE
                 if mkey == "spreads":
                     n1, n2 = o1.get("name"), o2.get("name")
                     p1, p2 = o1.get("price"), o2.get("price")
@@ -373,14 +366,15 @@ def pick_candidates(games, league_label: str):
                     pl_probs.setdefault(line_id, []).append((t1, t2, k1, k2, bw))
                     pl_best.setdefault(line_id, {})
 
-                    for k, od in [(k1, p1), (k2, p2)]:
+                    for k, od in ((k1, p1), (k2, p2)):
                         cur = pl_best[line_id].get(k)
                         if cur is None or od > cur["odds"]:
                             pl_best[line_id][k] = {"odds": od, "book": book_name}
 
-                # ---------- TOTALS ----------
+                # TOTALS
                 if mkey == "totals":
-                    n1, n2 = str(o1.get("name", "")).lower(), str(o2.get("name", "")).lower()
+                    n1 = str(o1.get("name", "")).lower()
+                    n2 = str(o2.get("name", "")).lower()
                     p1, p2 = o1.get("price"), o2.get("price")
                     pt1, pt2 = o1.get("point"), o2.get("point")
                     if not isinstance(p1, int) or not isinstance(p2, int):
@@ -418,13 +412,13 @@ def pick_candidates(games, league_label: str):
                     if cur_under is None or under_odds > cur_under["odds"]:
                         tot_best[total_point][under_key] = {"odds": under_odds, "book": book_name}
 
-        # ---- ML candidates ----
+        # ML candidates
         if ml_probs and ml_best[home] and ml_best[away]:
             wt_sum = sum(wt for (_, _, wt) in ml_probs) or 1.0
             p_home = sum(ph * wt for (ph, _, wt) in ml_probs) / wt_sum
             p_away = sum(pa * wt for (_, pa, wt) in ml_probs) / wt_sum
 
-            for team, p_true in [(home, p_home), (away, p_away)]:
+            for team, p_true in ((home, p_home), (away, p_away)):
                 best = ml_best[team]
                 odds = int(best["odds"])
                 ev = ev_per_1_stake(float(p_true), odds)
@@ -441,14 +435,14 @@ def pick_candidates(games, league_label: str):
                     "n_books": len(ml_probs),
                 })
 
-        # ---- PL candidates ----
+        # PL candidates
         for line_id, rows in pl_probs.items():
             wt_sum = sum(r[4] for r in rows) or 1.0
             p1 = sum(r[0] * r[4] for r in rows) / wt_sum
             p2 = sum(r[1] * r[4] for r in rows) / wt_sum
             k1 = rows[0][2]
             k2 = rows[0][3]
-            for k, p_true in [(k1, p1), (k2, p2)]:
+            for k, p_true in ((k1, p1), (k2, p2)):
                 best = pl_best[line_id].get(k)
                 if not best:
                     continue
@@ -467,14 +461,14 @@ def pick_candidates(games, league_label: str):
                     "n_books": len(rows),
                 })
 
-        # ---- TOTAL candidates ----
+        # TOTAL candidates
         for total_point, rows in tot_probs.items():
             wt_sum = sum(r[4] for r in rows) or 1.0
             p_over = sum(r[0] * r[4] for r in rows) / wt_sum
             p_under = sum(r[1] * r[4] for r in rows) / wt_sum
             over_key = rows[0][2]
             under_key = rows[0][3]
-            for k, p_true in [(over_key, p_over), (under_key, p_under)]:
+            for k, p_true in ((over_key, p_over), (under_key, p_under)):
                 best = tot_best[total_point].get(k)
                 if not best:
                     continue
@@ -496,21 +490,15 @@ def pick_candidates(games, league_label: str):
     return candidates
 
 # =========================================================
-# CLV UPDATER
+# CLV UPDATER (NHL ONLY FOR NOW)
 # =========================================================
 def find_best_odds_for_bet(cands, bet_row):
     for c in cands:
-        if (
-            c["game_id"] == bet_row["game_id"]
-            and c["market"] == bet_row["market"]
-            and c["pick"] == bet_row["pick"]
-        ):
+        if c["game_id"] == bet_row["game_id"] and c["market"] == bet_row["market"] and c["pick"] == bet_row["pick"]:
             return int(c["odds"])
     return None
 
 def update_closing_lines_for_open_bets():
-    # For CLV updates we’ll just pull NHL (fast + simple).
-    # If you want CLV across selected leagues later, we can store league in DB and update per league.
     games = fetch_odds(LEAGUES["NHL"])
     save_snapshot(games, sport=LEAGUES["NHL"])
     cands = pick_candidates(games, league_label="NHL")
@@ -524,11 +512,10 @@ def update_closing_lines_for_open_bets():
         if close is None:
             continue
         cents = clv_cents(int(b["odds_placed"]), int(close))
-        conn.execute("""
-          UPDATE bets
-          SET close_odds=?, clv_cents=?
-          WHERE id=?
-        """, (int(close), float(cents), int(b["id"])))
+        conn.execute(
+            "UPDATE bets SET close_odds=?, clv_cents=? WHERE id=?",
+            (int(close), float(cents), int(b["id"])),
+        )
         updated += 1
 
     conn.commit()
@@ -543,34 +530,27 @@ init_db()
 # =========================================================
 # STREAMLIT UI
 # =========================================================
-st.set_page_config(page_title="Myles’s Pro Hockey Picks", page_icon="🏒", layout="centered")
+st.set_page_config(page_title="Myles’s Professional Hockey Picks", page_icon="🏒", layout="centered")
 
+# Basic styling (no triple-quoted f-strings)
 st.markdown(
-    """
-<style>
-.badge {
-  display:inline-block; padding:3px 10px; border-radius:999px;
-  font-size:12px; font-weight:700; border:1px solid rgba(255,255,255,0.15);
-}
-.badge-thin { background: rgba(255, 193, 7, 0.15); }
-.badge-normal { background: rgba(13, 202, 240, 0.15); }
-.badge-rich { background: rgba(25, 135, 84, 0.15); }
-.badge-edge { background: rgba(25, 135, 84, 0.20); }
-.badge-strong { background: rgba(25, 135, 84, 0.18); }
-.badge-med { background: rgba(255, 193, 7, 0.15); }
-.badge-small { background: rgba(108, 117, 125, 0.12); }
-.muted { opacity: 0.85; }
-</style>
-""",
+    "<style>"
+    ".badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:700;"
+    "border:1px solid rgba(255,255,255,0.15);}"
+    ".badge-thin{background:rgba(255,193,7,0.15);}"
+    ".badge-normal{background:rgba(13,202,240,0.15);}"
+    ".badge-rich{background:rgba(25,135,84,0.15);}"
+    ".badge-edge{background:rgba(25,135,84,0.20);}"
+    ".badge-strong{background:rgba(25,135,84,0.18);}"
+    ".badge-med{background:rgba(255,193,7,0.15);}"
+    ".badge-small{background:rgba(108,117,125,0.12);}"
+    ".muted{opacity:0.85;}"
+    "</style>",
     unsafe_allow_html=True,
 )
 
-st.markdown(
-    """
-# 🏒 Myles’s Pro Hockey Picks
-*Pregame only · Ranked best → worst · ML · Puck Line · Totals*
-""".strip()
-)
+st.markdown("# 🏒 Myles’s Professional Hockey Picks")
+st.markdown("*Pregame only · Ranked best → worst · ML · Puck Line · Totals*")
 st.caption(f"Updated {date.today().strftime('%B %d, %Y')}")
 st.divider()
 
@@ -580,15 +560,11 @@ if not API_KEY:
 
 tab_picks, tab_tracker = st.tabs(["Picks", "Tracker"])
 
-# Session state to allow saving after a run
-if "last_to_stake" not in st.session_state:
-    st.session_state.last_to_stake = []
-if "last_stakes" not in st.session_state:
-    st.session_state.last_stakes = []
-if "last_ranked" not in st.session_state:
-    st.session_state.last_ranked = []
-if "last_plan" not in st.session_state:
-    st.session_state.last_plan = None
+# session state for saving after run
+st.session_state.setdefault("last_to_stake", [])
+st.session_state.setdefault("last_stakes", [])
+st.session_state.setdefault("last_ranked", [])
+st.session_state.setdefault("last_plan", None)
 
 # -----------------------
 # PICKS TAB
@@ -615,6 +591,7 @@ with tab_picks:
 
         only_bov = st.toggle("Only show Bovada picks", value=False)
         show_top_n = st.slider("Show up to", 1, 25, 10)
+        st.caption("These are qualifying +EV bets you can review (ranked).")
 
     with colR:
         auto_mode = st.toggle("Auto mode (recommended)", value=True)
@@ -636,21 +613,18 @@ with tab_picks:
             disabled=auto_mode,
         )
 
-    EV_MAP = {
-        "Loose (more bets)": 0.015,
-        "Balanced": 0.025,
-        "Strict (fewer bets)": 0.035
-    }
+    EV_MAP = {"Loose (more bets)": 0.015, "Balanced": 0.025, "Strict (fewer bets)": 0.035}
     min_ev = float(EV_MAP[edge_filter])
 
     with st.expander("Legend / Edge info", expanded=False):
         st.caption("**Edge = expected value (EV).** Higher edge = better long-run value, not guaranteed wins.")
-        st.markdown("- 🟢 **STRONG** ≥ 0.050\n- 🟡 **MEDIUM** ≥ 0.030\n- ⚪ **SMALL** ≥ 0.015")
+        st.markdown("- 🟢 **STRONG** ≥ 0.050\n- 🟡 **MEDIUM** ≥ 0.030\n- ⚪ **SMALL** ≥ 0.015\n- 💤 **TINY** < 0.015")
 
+    books_txt = "Bovada only" if only_bov else "All"
+    leagues_txt = ", ".join(selected_leagues) if selected_leagues else "—"
     st.caption(
-        f"Current threshold: **{min_ev:.3f} EV per $1** (≈ **${min_ev*100:.2f} per $100** long-run)."
-        + (" • **Books: Bovada only**" if only_bov else " • **Books: All**")
-        + (f" • **Leagues: {', '.join(selected_leagues) if selected_leagues else '—'}**")
+        f"Current threshold: **{min_ev:.3f} EV per $1** (≈ **${min_ev*100:.2f} per $100** long-run) • "
+        f"Books: **{books_txt}** • Leagues: **{leagues_txt}**"
     )
 
     if st.button("Run Model"):
@@ -658,7 +632,6 @@ with tab_picks:
             st.warning("Select at least one league.")
             st.stop()
 
-        # Fetch + build candidates per league, then combine
         all_cands = []
         for lg in selected_leagues:
             sport_key = LEAGUES[lg]
@@ -671,25 +644,21 @@ with tab_picks:
             st.warning("PASS — no odds returned.")
             st.stop()
 
-        # Optional Bovada-only filter (early, so slate quality is correct)
         if only_bov:
             cands = [c for c in cands if is_bovada(c.get("book", ""))]
             if not cands:
                 st.warning("No Bovada lines found for the selected leagues. Turn off Bovada-only or change leagues.")
                 st.stop()
 
-        # Sort all candidates by EV
         cands.sort(key=lambda x: float(x["ev"]), reverse=True)
         best_any = float(cands[0]["ev"])
 
-        # Filter by threshold
         qualified = [c for c in cands if float(c["ev"]) >= float(min_ev)]
         qualified.sort(key=lambda x: float(x["ev"]), reverse=True)
 
         if not qualified:
             st.warning(
-                f"PASS — Best edge found was {best_any:.3f} EV per $1 "
-                f"(below your {min_ev:.3f} threshold)."
+                f"PASS — Best edge found was {best_any:.3f} EV per $1 (below your {min_ev:.3f} threshold)."
             )
             st.subheader("Closest opportunities (below threshold)")
             for i, c in enumerate(cands[:5], start=1):
@@ -744,21 +713,19 @@ with tab_picks:
             "leagues": selected_leagues,
         }
 
-        quality_badge_class = {"THIN": "badge-thin", "NORMAL": "badge-normal", "RICH": "badge-rich"}.get(quality, "badge-normal")
-        st.markdown(
-            f"""
-<div class="muted">
-  <span class="badge {quality_badge_class}">SLATE: {quality}</span>
-  &nbsp; <span class="badge">Qualifying: {len(qualified)}</span>
-  &nbsp; <span class="badge">Staking: {len(to_stake)}</span>
-  &nbsp; <span class="badge">Bankroll used: ${int(bankroll_to_use)}</span>
-</div>
-""".strip(),
-            unsafe_allow_html=True,
+        quality_class = {"THIN": "badge-thin", "NORMAL": "badge-normal", "RICH": "badge-rich"}.get(quality, "badge-normal")
+        badges = (
+            f'<div class="muted">'
+            f'<span class="badge {quality_class}">SLATE: {quality}</span>&nbsp;'
+            f'<span class="badge">Qualifying: {len(qualified)}</span>&nbsp;'
+            f'<span class="badge">Staking: {len(to_stake)}</span>&nbsp;'
+            f'<span class="badge">Bankroll used: ${int(bankroll_to_use)}</span>'
+            f'</div>'
         )
+        st.markdown(badges, unsafe_allow_html=True)
         st.caption(f"Total edge (top 8): **{ev_sum_topk:.3f} EV/$1** (bigger = more opportunity).")
         if only_bov:
-            st.caption("Bovada-only is ON — fewer lines means fewer qualifying bets on some nights.")
+            st.caption("Bovada-only is ON — some nights will be thinner.")
         st.caption("Max bets to stake is **up to N** — the app won’t force volume when edges aren’t there.")
         st.divider()
 
@@ -777,32 +744,112 @@ with tab_picks:
             ev100 = ev1 * 100.0
             label = confidence_label(ev1)
 
-            is_staked = c in to_stake
-            tag = "✅ STAKED" if is_staked else "👀 WATCH"
+            is_staked_pick = c in to_stake
+            tag = "✅ STAKED" if is_staked_pick else "👀 WATCH"
+
+            conf_class = {"STRONG": "badge-strong", "MEDIUM": "badge-med", "SMALL": "badge-small"}.get(label, "badge-small")
+            conf_badge = f'<span class="badge {conf_class}">{label}</span>'
 
             edge_badge = ""
             if label == "STRONG":
                 edge_badge_text = "TOP EDGE" if i == 1 else "EDGE"
                 edge_badge = f' <span class="badge badge-edge">{edge_badge_text}</span>'
 
-            conf_class = {"STRONG": "badge-strong", "MEDIUM": "badge-med", "SMALL": "badge-small"}.get(label, "badge-small")
-            conf_badge = f'<span class="badge {conf_class}">{label}</span>'
-
-            stake_text = ""
-            if is_staked:
+            stake_html = ""
+            if is_staked_pick:
                 s = stakes[to_stake.index(c)]
-                stake_text = f" • <b>Stake: ${int(s)}</b>"
+                stake_html = f' • <b>Stake: ${int(s)}</b>'
 
             league_tag = f"[{c.get('league','—')}]"
 
+            header_html = (
+                f"<div style='font-size:18px;font-weight:800;'>"
+                f"{i}. {tag} — {league_tag} {c['game']} — {c['pick']} ({c['market']}) "
+                f"{c['odds']} @ {c['book']} {conf_badge}{edge_badge}"
+                f"<span class='muted'>{stake_html}</span>"
+                f"</div>"
+            )
+            sub_html = (
+                f"<div class='muted' style='margin-top:6px;'>"
+                f"Edge: <b>${ev100:.2f} per $100</b> (EV per $1: {ev1:.3f}) • Books used: {c.get('n_books','—')}"
+                f"</div>"
+            )
+
             with st.container(border=True):
-                st.markdown(
-                    f"""
-<div>
-  <div style="font-size:18px; font-weight:800;">
-    {i}. {tag} — {league_tag} {c['game']} — {c['pick']} ({c['market']}) {c['odds']} @ {c['book']}
-    {conf_badge}{edge_badge}
-    <span class="muted">{stake_text}</span>
-  </div>
-  <div class="muted" style="margin-top:6px;">
-    Edge: <b>${ev100:.2f} per $100</b> (EV per $1: {ev1:.3f}) • Books us
+                st.markdown(header_html + sub_html, unsafe_allow_html=True)
+                with st.expander("Why this bet?"):
+                    fair = fair_american_from_p(float(c["p_true"]))
+                    st.write(f"Fair (no-vig) line: **{fair}**")
+                    st.write(f"Best available: **{c['odds']} @ {c['book']}**")
+                    st.write(f"Model p_true: **{float(c['p_true']):.3f}**")
+                    st.write(f"EV per $100: **${float(c['ev']) * 100:.2f}**")
+
+        st.divider()
+        st.subheader("Action")
+        if st.button("Save these bets to Tracker"):
+            if not st.session_state.last_to_stake:
+                st.warning("No staked bets to save (either slate is thin or max bets is too low).")
+            else:
+                save_bets(st.session_state.last_to_stake, st.session_state.last_stakes)
+                st.success("Saved! Go to the Tracker tab to view CLV and results.")
+
+# -----------------------
+# TRACKER TAB
+# -----------------------
+with tab_tracker:
+    st.subheader("Bet Tracker (CLV + Results)")
+    st.caption("Update closing lines near game time to measure CLV. Mark results manually (MVP).")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Update closing lines (CLV) for OPEN bets"):
+            n = update_closing_lines_for_open_bets()
+            st.success(f"Updated closing lines for {n} open bets.")
+    with col2:
+        st.write("")
+
+    conn = db()
+    rows = conn.execute("""
+      SELECT id, placed_ts_utc, game, market, pick, book,
+             odds_placed, stake, close_odds, clv_cents, status
+      FROM bets
+      ORDER BY id DESC
+      LIMIT 200
+    """).fetchall()
+    conn.close()
+
+    if not rows:
+        st.info("No bets saved yet. Run the model, then save bets to start tracking.")
+    else:
+        clv_vals = [r["clv_cents"] for r in rows if r["clv_cents"] is not None]
+        avg_clv = sum(clv_vals) / len(clv_vals) if clv_vals else None
+
+        st.metric("Tracked bets", len(rows))
+        if avg_clv is not None:
+            st.metric("Avg CLV (cents)", f"{avg_clv:.2f}")
+
+        st.divider()
+
+        for r in rows:
+            with st.container(border=True):
+                st.markdown(f"**{r['game']}** — {r['pick']} ({r['market']})")
+                st.caption(f"Placed: {r['placed_ts_utc']} • Book: {r['book']} • Stake: ${r['stake']}")
+
+                if r["clv_cents"] is not None:
+                    st.write(
+                        f"Odds placed: **{r['odds_placed']}** | "
+                        f"Close: **{r['close_odds'] if r['close_odds'] is not None else '—'}** | "
+                        f"CLV: **{r['clv_cents']:.2f}** cents"
+                    )
+                else:
+                    st.write("Odds placed: **{0}** | Close: **—** | CLV: **—**".format(r["odds_placed"]))
+
+                status = st.selectbox(
+                    "Set status",
+                    ["OPEN", "WIN", "LOSS", "PUSH", "VOID"],
+                    index=["OPEN", "WIN", "LOSS", "PUSH", "VOID"].index(r["status"]),
+                    key=f"status_{r['id']}",
+                )
+                if st.button("Save status", key=f"save_status_{r['id']}"):
+                    update_bet_status(int(r["id"]), status)
+                    st.success("Status updated.")
