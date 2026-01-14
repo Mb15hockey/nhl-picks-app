@@ -1,7 +1,7 @@
 import os
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 import requests
 import streamlit as st
 
@@ -29,6 +29,12 @@ BOOK_WEIGHTS = {
 def w(book_name: str) -> float:
     return float(BOOK_WEIGHTS.get(book_name, 1.0))
 
+def is_bovada(book: str) -> bool:
+    if not book:
+        return False
+    b = str(book).strip().lower()
+    return (b == "bovada") or ("bovada" in b)
+
 def implied_prob_from_odds(odds: int) -> float:
     if odds > 0:
         return 100.0 / (odds + 100.0)
@@ -49,11 +55,11 @@ def devig_two_way(p1, p2):
 
 def confidence_label(ev):
     if ev >= 0.05:
-        return "STRONG ✅"
+        return "STRONG"
     if ev >= 0.03:
-        return "MEDIUM 👍"
+        return "MEDIUM"
     if ev >= 0.015:
-        return "SMALL ⚠️"
+        return "SMALL"
     return "TINY"
 
 def odds_to_decimal(odds: int) -> float:
@@ -128,6 +134,40 @@ def fair_american_from_p(p: float) -> int:
     if dec >= 2.0:
         return int(round((dec - 1.0) * 100))
     return int(round(-100.0 / (dec - 1.0)))
+
+def slate_quality_and_plan(qualified_sorted, daily_bankroll: int):
+    """
+    Uses TOP 8 qualified bets to score slate. EV is per $1.
+    Returns: (quality_str, ev_sum_topk, suggested_max_bets, suggested_stake_method, bankroll_use_ratio)
+    """
+    n = len(qualified_sorted)
+    topk = min(8, n)
+    ev_sum = sum(float(x["ev"]) for x in qualified_sorted[:topk]) if topk > 0 else 0.0
+
+    # thresholds tuned for your EV scale
+    thin = (n < 4) or (ev_sum < 0.18)
+    rich = (n >= 9) or (ev_sum >= 0.35)
+
+    if thin:
+        quality = "THIN"
+        suggested_max_bets = min(3, n) if n > 0 else 0
+        suggested_stake_method = "Quarter Kelly (conservative)"
+        bankroll_use_ratio = 0.80  # don’t force full roll on thin slates
+    elif rich:
+        quality = "RICH"
+        suggested_max_bets = min(10, n) if n > 0 else 0
+        suggested_stake_method = "Flat (even split)"
+        bankroll_use_ratio = 1.00
+    else:
+        quality = "NORMAL"
+        suggested_max_bets = min(8, n) if n > 0 else 0
+        suggested_stake_method = "Flat (even split)"
+        bankroll_use_ratio = 1.00
+
+    bankroll_to_use = int(round(daily_bankroll * bankroll_use_ratio))
+    bankroll_to_use = max(0, bankroll_to_use)
+
+    return quality, ev_sum, suggested_max_bets, suggested_stake_method, bankroll_to_use
 
 # =========================================================
 # DB LAYER
@@ -480,11 +520,39 @@ def update_closing_lines_for_open_bets():
 init_db()
 
 # =========================================================
-# STREAMLIT UI
+# STREAMLIT UI (POLISH)
 # =========================================================
-st.set_page_config(page_title="NHL Picks", page_icon="🏒", layout="centered")
-st.title("🏒 NHL Picks")
-st.caption("Pregame only • Ranked best → worst • ML + Puck Line + Totals • Tracker + CLV")
+st.set_page_config(page_title="Myles’s NHL Edge Picks", page_icon="🏒", layout="centered")
+
+# Minimal styling (cards + badges)
+st.markdown(
+    """
+<style>
+.badge {
+  display:inline-block; padding:3px 10px; border-radius:999px;
+  font-size:12px; font-weight:700; border:1px solid rgba(255,255,255,0.15);
+}
+.badge-thin { background: rgba(255, 193, 7, 0.15); }
+.badge-normal { background: rgba(13, 202, 240, 0.15); }
+.badge-rich { background: rgba(25, 135, 84, 0.15); }
+.badge-edge { background: rgba(25, 135, 84, 0.20); }
+.badge-strong { background: rgba(25, 135, 84, 0.18); }
+.badge-med { background: rgba(255, 193, 7, 0.15); }
+.badge-small { background: rgba(108, 117, 125, 0.12); }
+.muted { opacity: 0.85; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+# 🏒 Myles’s NHL Edge Picks
+*Pregame only · Ranked best → worst · ML · Puck Line · Totals*
+""".strip()
+)
+st.caption(f"Updated {date.today().strftime('%B %d, %Y')}")
+st.divider()
 
 if not API_KEY:
     st.error("ODDS_API_KEY not set in Railway variables.")
@@ -492,43 +560,73 @@ if not API_KEY:
 
 tab_picks, tab_tracker = st.tabs(["Picks", "Tracker"])
 
+# Session state to allow saving after a run
+if "last_to_stake" not in st.session_state:
+    st.session_state.last_to_stake = []
+if "last_stakes" not in st.session_state:
+    st.session_state.last_stakes = []
+if "last_ranked" not in st.session_state:
+    st.session_state.last_ranked = []
+if "last_plan" not in st.session_state:
+    st.session_state.last_plan = None
+
 # -----------------------
 # PICKS TAB
 # -----------------------
 with tab_picks:
-    pickiness = st.radio(
-        "Pickiness (minimum edge required)",
-        ["Loose (more bets)", "Balanced", "Strict (fewer bets)"],
-        index=1,
-        horizontal=True,
-    )
+    # ---- Controls (two columns) ----
+    colL, colR = st.columns(2)
+
+    with colL:
+        edge_filter = st.radio(
+            "Edge filter",
+            ["Loose (more bets)", "Balanced", "Strict (fewer bets)"],
+            index=1,
+            horizontal=True,
+        )
+
+        only_bov = st.toggle("Only show Bovada picks", value=False)
+
+        show_top_n = st.slider("Show up to", 1, 25, 10)
+        st.caption("These are qualifying +EV bets you can review (ranked).")
+
+    with colR:
+        auto_mode = st.toggle("Auto mode (recommended)", value=True)
+
+        max_bets_to_stake = st.slider("Max bets to stake", 1, 10, 8)
+        daily_bankroll = st.number_input("Tonight’s bankroll ($)", min_value=10, max_value=5000, value=100, step=10)
+
+        stake_method_manual = st.radio(
+            "Stake sizing",
+            ["Flat (even split)", "Quarter Kelly (conservative)", "Half Kelly (balanced)"],
+            index=0,
+            horizontal=True,
+            disabled=auto_mode,  # auto controls this
+        )
+
+        bankroll_use_manual = st.selectbox(
+            "Max bankroll to use",
+            ["Auto", "100%", "80%", "60%"],
+            index=0,
+            disabled=auto_mode,  # auto controls this
+        )
 
     EV_MAP = {
         "Loose (more bets)": 0.015,
         "Balanced": 0.025,
         "Strict (fewer bets)": 0.035
     }
-    min_ev = EV_MAP[pickiness]
+    min_ev = float(EV_MAP[edge_filter])
 
-    st.caption(f"Current threshold: **{min_ev:.3f} EV per $1** (≈ **${min_ev*100:.2f} per $100** long-run)")
+    # Legend + tiny tooltip (no explainer page)
+    with st.expander("Legend / Edge info", expanded=False):
+        st.caption("**Edge = expected value (EV).** Higher edge = better long-run value, not guaranteed wins.")
+        st.markdown("- 🟢 **STRONG** ≥ 0.050\n- 🟡 **MEDIUM** ≥ 0.030\n- ⚪ **SMALL** ≥ 0.015")
 
-    show_top_n = st.slider("Show up to N opportunities (ranked)", 1, 25, 10)
-    st.caption("These are all qualifying +EV bets you can review (not all will be staked).")
-
-    stake_top_n = st.slider("Number of bets to stake today", 1, 10, 3)
-    st.caption("Stakes are assigned only to the top bets you choose to stake.")
-
-    daily_bankroll = st.number_input("Daily bankroll ($)", min_value=10, max_value=5000, value=100, step=10)
-
-    stake_method = st.radio(
-        "Stake method",
-        ["Flat (even split)", "Quarter Kelly (conservative)", "Half Kelly (balanced)"],
-        index=0,
-        horizontal=True,
+    st.caption(
+        f"Current threshold: **{min_ev:.3f} EV per $1** (≈ **${min_ev*100:.2f} per $100** long-run)."
+        + (" • **Books: Bovada only**" if only_bov else " • **Books: All**")
     )
-
-    st.caption("Confidence reflects **edge size (EV)**, not the chance of winning any single bet.")
-    st.caption("Legend: STRONG ≥ 0.050 • MEDIUM ≥ 0.030 • SMALL ≥ 0.015 • TINY < 0.015 (EV per $1)")
 
     if st.button("Run Model"):
         games = fetch_odds()
@@ -539,15 +637,22 @@ with tab_picks:
             st.warning("PASS — no odds returned.")
             st.stop()
 
+        # Optional Bovada-only filter (early, so slate quality is correct)
+        if only_bov:
+            cands = [c for c in cands if is_bovada(c.get("book", ""))]
+            if not cands:
+                st.warning("No Bovada lines found for this slate. Turn off Bovada-only to include other books.")
+                st.stop()
+
         # Sort all candidates by EV
-        cands.sort(key=lambda x: x["ev"], reverse=True)
+        cands.sort(key=lambda x: float(x["ev"]), reverse=True)
         best_any = float(cands[0]["ev"])
 
         # Filter by threshold
-        filtered = [c for c in cands if float(c["ev"]) >= float(min_ev)]
-        filtered.sort(key=lambda x: x["ev"], reverse=True)
+        qualified = [c for c in cands if float(c["ev"]) >= float(min_ev)]
+        qualified.sort(key=lambda x: float(x["ev"]), reverse=True)
 
-        if not filtered:
+        if not qualified:
             st.warning(
                 f"PASS — Best edge found was {best_any:.3f} EV per $1 "
                 f"(below your {min_ev:.3f} threshold)."
@@ -556,59 +661,129 @@ with tab_picks:
             for i, c in enumerate(cands[:5], start=1):
                 st.write(
                     f"{i}) {c['game']} — {c['pick']} ({c['market']}) "
-                    f"{c['odds']} @ {c['book']} — EV {c['ev']:.3f}"
+                    f"{c['odds']} @ {c['book']} — EV {float(c['ev']):.3f}"
                 )
             st.stop()
 
-        # "Show up to N opportunities"
-        ranked = filtered[: int(show_top_n)]
-        to_stake = ranked[: int(min(stake_top_n, len(ranked)))]
+        # Show up to N opportunities
+        ranked = qualified[: int(show_top_n)]
 
-        # Stakes for the staked picks only
+        # --- Slate quality + auto plan (based on qualified set) ---
+        quality, ev_sum_topk, suggested_max_bets, suggested_stake_method, bankroll_to_use_auto = slate_quality_and_plan(
+            qualified_sorted=qualified,
+            daily_bankroll=int(daily_bankroll),
+        )
+
+        # Decide stake sizing + bankroll to use
+        if auto_mode:
+            stake_method = suggested_stake_method
+            bankroll_to_use = bankroll_to_use_auto
+            max_bets_effective = min(int(suggested_max_bets), int(max_bets_to_stake)) if suggested_max_bets else 0
+        else:
+            stake_method = stake_method_manual
+            if bankroll_use_manual == "100%":
+                bankroll_to_use = int(daily_bankroll)
+            elif bankroll_use_manual == "80%":
+                bankroll_to_use = int(round(daily_bankroll * 0.80))
+            elif bankroll_use_manual == "60%":
+                bankroll_to_use = int(round(daily_bankroll * 0.60))
+            else:
+                bankroll_to_use = int(daily_bankroll)
+            max_bets_effective = min(int(max_bets_to_stake), len(ranked))
+
+        # Bets to stake = up to N (never forced)
+        to_stake = ranked[: int(max_bets_effective)]
+
+        # Compute stakes for staked picks only
         if stake_method.startswith("Flat"):
-            stakes = stake_split_flat(int(daily_bankroll), len(to_stake))
+            stakes = stake_split_flat(int(bankroll_to_use), len(to_stake))
         else:
             k_frac = 0.25 if "Quarter" in stake_method else 0.50
-            stakes = stake_split_kelly_scaled(int(daily_bankroll), to_stake, kelly_fraction=k_frac)
+            stakes = stake_split_kelly_scaled(int(bankroll_to_use), to_stake, kelly_fraction=k_frac)
 
-        # Clear, non-confusing headers
-        qualifying_count = len(filtered)
-        shown_count = len(ranked)
+        # Save results to session state for the "Save to Tracker" button
+        st.session_state.last_ranked = ranked
+        st.session_state.last_to_stake = to_stake
+        st.session_state.last_stakes = stakes
+        st.session_state.last_plan = {
+            "quality": quality,
+            "ev_sum_topk": ev_sum_topk,
+            "stake_method": stake_method,
+            "bankroll_to_use": bankroll_to_use,
+            "min_ev": min_ev,
+            "only_bov": only_bov,
+            "auto_mode": auto_mode,
+        }
 
-        st.subheader(f"Ranked Opportunities — {qualifying_count} passed your EV filter")
-        if qualifying_count < show_top_n:
-            st.caption(
-                f"You asked to show up to **{show_top_n}**, but only **{qualifying_count}** met the minimum edge today."
-            )
+        # ---- Daily Plan card ----
+        quality_badge_class = {"THIN": "badge-thin", "NORMAL": "badge-normal", "RICH": "badge-rich"}.get(quality, "badge-normal")
+        st.markdown(
+            f"""
+<div class="muted">
+  <span class="badge {quality_badge_class}">SLATE: {quality}</span>
+  &nbsp; <span class="badge">Qualifying: {len(qualified)}</span>
+  &nbsp; <span class="badge">Staking: {len(to_stake)}</span>
+  &nbsp; <span class="badge">Bankroll used: ${int(bankroll_to_use)}</span>
+</div>
+""".strip(),
+            unsafe_allow_html=True,
+        )
+        st.caption(f"Total edge (top 8): **{ev_sum_topk:.3f} EV/$1** (bigger = more opportunity).")
+        if only_bov:
+            st.caption("Bovada-only is ON — fewer lines means fewer qualifying bets on some nights.")
+        st.caption("Max bets to stake is **up to N** — the app won’t force volume when edges aren’t there.")
+
+        st.divider()
+
+        # ---- Ranked section header ----
+        st.subheader(f"Ranked Opportunities — {len(qualified)} passed your edge filter")
+        if len(qualified) < show_top_n:
+            st.caption(f"You asked to show up to **{show_top_n}**, but only **{len(qualified)}** met the minimum edge today.")
         else:
-            st.caption(f"Showing the top **{shown_count}** opportunities (ranked best → worst).")
-
-        st.caption("Only the top bets you selected in **Number of bets to stake today** will show a stake amount.")
+            st.caption(f"Showing the top **{len(ranked)}** opportunities (ranked best → worst).")
 
         total_staked = sum(int(s) for s in stakes) if stakes else 0
-        unused = int(daily_bankroll) - total_staked
-        st.caption(f"Bankroll: **${int(daily_bankroll)}** • Staked: **${total_staked}** • Unused: **${unused}**")
+        unused = int(bankroll_to_use) - total_staked
+        st.caption(f"Bankroll used: **${int(bankroll_to_use)}** • Staked: **${total_staked}** • Unused: **${unused}**")
 
+        # ---- Render picks ----
         for i, c in enumerate(ranked, start=1):
             ev1 = float(c["ev"])
             ev100 = ev1 * 100.0
             label = confidence_label(ev1)
 
-            is_staked = (c in to_stake)
+            is_staked = c in to_stake
             tag = "✅ STAKED" if is_staked else "👀 WATCH"
+
+            # Edge badge for STRONG (and TOP EDGE for #1)
+            edge_badge = ""
+            if label == "STRONG":
+                edge_badge_text = "TOP EDGE" if i == 1 else "EDGE"
+                edge_badge = f' <span class="badge badge-edge">{edge_badge_text}</span>'
+
+            conf_class = {"STRONG": "badge-strong", "MEDIUM": "badge-med", "SMALL": "badge-small"}.get(label, "badge-small")
+            conf_badge = f'<span class="badge {conf_class}">{label}</span>'
 
             stake_text = ""
             if is_staked:
                 s = stakes[to_stake.index(c)]
-                stake_text = f" • **Stake: ${int(s)}**"
+                stake_text = f" • <b>Stake: ${int(s)}</b>"
 
             with st.container(border=True):
                 st.markdown(
-                    f"### {i}. {tag} — {c['game']} — {c['pick']} ({c['market']}) "
-                    f"{c['odds']} @ {c['book']} — **{label}**{stake_text}"
-                )
-                st.caption(
-                    f"Edge: ${ev100:.2f} per $100 (EV per $1: {ev1:.3f}) • Books used: {c.get('n_books','—')}"
+                    f"""
+<div>
+  <div style="font-size:18px; font-weight:800;">
+    {i}. {tag} — {c['game']} — {c['pick']} ({c['market']}) {c['odds']} @ {c['book']}
+    {conf_badge}{edge_badge}
+    <span class="muted">{stake_text}</span>
+  </div>
+  <div class="muted" style="margin-top:6px;">
+    Edge: <b>${ev100:.2f} per $100</b> (EV per $1: {ev1:.3f}) • Books used: {c.get('n_books','—')}
+  </div>
+</div>
+""".strip(),
+                    unsafe_allow_html=True,
                 )
 
                 with st.expander("Why this bet?"):
@@ -621,10 +796,12 @@ with tab_picks:
         st.divider()
         st.subheader("Action")
         if st.button("Save these bets to Tracker"):
-            if not to_stake:
-                st.warning("No staked bets to save (increase ‘Number of bets to stake today’ or loosen your filter).")
+            to_stake_ss = st.session_state.last_to_stake
+            stakes_ss = st.session_state.last_stakes
+            if not to_stake_ss:
+                st.warning("No staked bets to save (either the slate is thin or your max bets is too low).")
             else:
-                save_bets(to_stake, stakes)
+                save_bets(to_stake_ss, stakes_ss)
                 st.success("Saved! Go to the Tracker tab to view CLV and results.")
 
 # -----------------------
