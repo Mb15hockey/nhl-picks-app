@@ -287,17 +287,30 @@ def fetch_odds(sport_key: str):
         "markets": "h2h,spreads,totals",
         "oddsFormat": "american",
     }
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
 
-    # Invisible quota logging (Railway logs only)
+    try:
+        r = requests.get(url, params=params, timeout=20)
+
+        if r.status_code == 401:
+            st.error(
+                "Odds API error (401): Your ODDS_API_KEY is missing or invalid. "
+                "Check Railway → Variables and redeploy."
+            )
+            st.stop()
+
+        r.raise_for_status()
+
+    except requests.RequestException as e:
+        st.error(f"Odds API request failed: {e}")
+        st.stop()
+
+    # Quiet quota logging (Railway logs only)
     rem = r.headers.get("x-requests-remaining")
     used = r.headers.get("x-requests-used")
     last = r.headers.get("x-requests-last")
     print(f"[OddsAPI] sport={sport_key} remaining={rem} used={used} last_cost={last}")
 
     return r.json()
-
 # =========================================================
 # CANDIDATE BUILDER (WITH BOOK WEIGHTING)
 # =========================================================
