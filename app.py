@@ -282,35 +282,41 @@ def update_bet_status(bet_id: int, new_status: str):
 # ODDS FETCH (PER LEAGUE)
 # =========================================================
 def fetch_odds(sport_key: str):
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-    params = {
-        "apiKey": API_KEY,
-        "regions": "us",
-        "markets": "h2h,spreads,totals",
-        "oddsFormat": "american",
-    }
+    base_url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+
+    def _request(markets: str):
+        params = {
+            "apiKey": API_KEY,
+            "regions": "us",
+            "markets": markets,
+            "oddsFormat": "american",
+        }
+        r = requests.get(base_url, params=params, timeout=20)
+        return r
+
+    # 1️⃣ Try full markets first
+    r = _request("h2h,spreads,totals")
+
+    if r.status_code in (401, 403):
+        # 2️⃣ Graceful fallback to moneyline-only
+        st.warning(
+            "Limited Odds API access detected — showing **Moneyline-only** prices for this league."
+        )
+        r = _request("h2h")
 
     try:
-        r = requests.get(url, params=params, timeout=20)
-
-        if r.status_code == 401:
-            st.error(
-                "Odds API error (401): Your ODDS_API_KEY is missing or invalid. "
-                "Check Railway → Variables and redeploy."
-            )
-            st.stop()
-
         r.raise_for_status()
-
     except requests.RequestException as e:
-        st.error(f"Odds API request failed: {e}")
+        st.error(f"Odds API request failed for {sport_key}: {e}")
         st.stop()
 
     # Quiet quota logging (Railway logs only)
     rem = r.headers.get("x-requests-remaining")
     used = r.headers.get("x-requests-used")
     last = r.headers.get("x-requests-last")
-    print(f"[OddsAPI] sport={sport_key} remaining={rem} used={used} last_cost={last}")
+    print(
+        f"[OddsAPI] sport={sport_key} remaining={rem} used={used} last_cost={last}"
+    )
 
     return r.json()
 # =========================================================
