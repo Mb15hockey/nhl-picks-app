@@ -9,6 +9,8 @@ import streamlit as st
 # CONFIG
 # =========================================================
 API_KEY = os.getenv("ODDS_API_KEY", "").strip()
+st.write("DEBUG: ODDS_API_KEY present?", bool(API_KEY))
+st.write("DEBUG: ODDS_API_KEY length:", len(API_KEY))
 DB_PATH = os.getenv("DB_PATH", "app.db")
 
 # Main hockey leagues (NHL + 4) — you can swap these later if you want
